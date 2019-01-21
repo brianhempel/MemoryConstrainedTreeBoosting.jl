@@ -178,7 +178,14 @@ end
 
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}, starting_scores = nothing) :: Vector{Prediction}
+function predict(X, bin_splits, trees; starting_scores = nothing) :: Vector{Prediction}
+  X_binned = apply_bins(X, bin_splits)
+
+  predict_on_binned(X_binned, trees, starting_scores = starting_scores)
+end
+
+# Returns vector of predictions ŷ (post-sigmoid).
+function predict_on_binned(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}; starting_scores = nothing) :: Vector{Prediction}
   scores = apply_trees(X_binned, trees, starting_scores)
   σ.(scores)
 end
