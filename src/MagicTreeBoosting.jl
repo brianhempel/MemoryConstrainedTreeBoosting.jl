@@ -1,6 +1,6 @@
 module MagicTreeBoosting
 
-export train, train_one_epoch, apply_bins, predict, save, load
+export train, train_one_iteration, apply_bins, predict, save, load
 
 import Random
 
@@ -8,10 +8,11 @@ import BSON
 
 
 default_config = (
-  bin_count     = 255,
-  epoch_count   = 10,
-  max_leaves    = 32,
-  learning_rate = 0.1,
+  bin_count               = 255,
+  iteration_count         = 10,
+  min_data_weight_in_leaf = 10.0,
+  max_leaves              = 32,
+  learning_rate           = 0.1,
 )
 
 function get_config_field(config, key)
@@ -30,6 +31,7 @@ const ε = 1e-15 # Smallest Float64 power of 10 you can add to 1.0 and not round
 const Score      = Float64
 const Loss       = Float64
 const Prediction = Float64
+const DataWeight = Float64
 
 const BinSplits = Vector{T} where T <: AbstractFloat
 
@@ -42,10 +44,11 @@ mutable struct SplitCandidate
 end
 
 mutable struct HistBin
-  Σ∇loss  :: Loss
-  Σ∇∇loss :: Loss
+  Σ∇loss      :: Loss
+  Σ∇∇loss     :: Loss
+  data_weight :: DataWeight
 
-  HistBin() = new(0.0, 0.0)
+  HistBin() = new(0.0, 0.0, 0.0)
 end
 
 mutable struct Node <: Tree
@@ -56,7 +59,7 @@ mutable struct Node <: Tree
 end
 
 mutable struct Leaf <: Tree
-  weight :: Score
+  Δscore :: Score # Called "weight" in the literature
   is :: Union{Vector{Int64},Nothing}                     # Transient. Needed during tree growing.
   maybe_split_candidate :: Union{SplitCandidate,Nothing} # Transient. Needed during tree growing.
 end
@@ -86,7 +89,7 @@ function print_tree(tree :: Tree, level)
     print_tree(tree.left,  level + 1)
     print_tree(tree.right, level + 1)
   else
-    println(indentation * "Leaf: weight $(tree.weight)\tis_count $(length(tree.is))")
+    println(indentation * "Leaf: Δscore $(tree.Δscore)\tis_count $(length(tree.is))")
   end
 end
 
@@ -120,14 +123,14 @@ function strip_tree_training_info(tree :: Tree) :: Tree
     right = strip_tree_training_info(tree.right)
     Node(tree.feature_i, tree.split_i, left, right)
   else
-    Leaf(tree.weight, nothing, nothing)
+    Leaf(tree.Δscore, nothing, nothing)
   end
 end
 
 # Mutates and returns tree.
-function scale_leaf_weights(tree, learning_rate)
+function scale_leaf_Δscores(tree, learning_rate)
   for leaf in tree_leaves(tree)
-    leaf.weight *= learning_rate
+    leaf.Δscore *= learning_rate
   end
   tree
 end
@@ -151,7 +154,7 @@ function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree, scores :: Vector)
         node = node.right
       end
     end
-    scores[i] += node.weight
+    scores[i] += node.Δscore
   end
 
   scores
@@ -232,7 +235,7 @@ end
 
 
 function build_one_tree(X_binned :: Array{UInt8,2}, y, ŷ; config...) # y = labels, ŷ = predictions so far
-  tree = Leaf(optimal_weight(y, ŷ), collect(1:length(y)), nothing)
+  tree = Leaf(optimal_Δscore(y, ŷ), collect(1:length(y)), nothing)
 
   tree_changed = true
 
@@ -240,14 +243,14 @@ function build_one_tree(X_binned :: Array{UInt8,2}, y, ŷ; config...) # y = labe
     # print_tree(tree, 0)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ; config...)
   end
 
   tree
 end
 
 
-# Trains for epoch_count rounds and teturns (bin_splits, prior_and_new_trees).
+# Trains for iteration_count rounds and returns (bin_splits, prior_and_new_trees).
 function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
   if bin_splits == nothing
     bin_splits = prepare_bin_splits(X, get_config_field(config, :bin_count))
@@ -261,13 +264,13 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
 
   trees = []
 
-  for epoch_i in 1:get_config_field(config, :epoch_count)
-    (scores, tree) = train_one_epoch(X_binned, y, scores; config...)
+  for iteration_i in 1:get_config_field(config, :iteration_count)
+    (scores, tree) = train_one_iteration(X_binned, y, scores; config...)
 
     ŷ = σ.(scores)
-    epoch_loss = sum(logloss.(y, ŷ)) / length(y)
+    iteration_loss = sum(logloss.(y, ŷ)) / length(y)
     # println(ŷ)
-    println("Epoch $epoch_i training loss: $epoch_loss")
+    println("Iteration $iteration_i training loss: $iteration_loss")
     push!(trees, tree)
   end
 
@@ -275,11 +278,11 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
 end
 
 # Returns (new_scores, tree)
-function train_one_epoch(X_binned, y, scores; config...)
+function train_one_iteration(X_binned, y, scores; config...)
   ŷ = σ.(scores)
   # println(ŷ)
-  tree = build_one_tree(X_binned, y, ŷ)
-  tree = scale_leaf_weights(tree, get_config_field(config, :learning_rate))
+  tree = build_one_tree(X_binned, y, ŷ; config...)
+  tree = scale_leaf_Δscores(tree, get_config_field(config, :learning_rate))
   new_scores = scores .+ apply_tree(X_binned, tree)
   (new_scores, tree)
 end
@@ -298,7 +301,7 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1 - y)*log(1 - ŷ + ε)
 
 
 # Assuming binary classification with log loss.
-function optimal_weight(y, ŷ)
+function optimal_Δscore(y, ŷ)
   Σ∇loss  = sum(∇logloss.(y, ŷ))
   Σ∇∇loss = sum(∇∇logloss.(ŷ))
 
@@ -316,12 +319,14 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, config...)
+function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ; config...)
   leaves = tree_leaves(tree)
 
   if length(leaves) >= get_config_field(config, :max_leaves)
     return (false, tree)
   end
+
+  min_data_weight_in_leaf = get_config_field(config, :min_data_weight_in_leaf)
 
   # Ensure split_candidate on all leaves
   for leaf in leaves
@@ -338,43 +343,51 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, config...)
 
         hist_bins = map(bin_i -> HistBin(), 1:max_bins)
 
-        this_leaf_Σ∇loss  = 0.0
-        this_leaf_Σ∇∇loss = 0.0
+        this_leaf_Σ∇loss      = 0.0
+        this_leaf_Σ∇∇loss     = 0.0
+        this_leaf_data_weight = 0.0
 
         for i in leaf.is
           bin_i    = X_binned[i, feature_i]
           hist_bin = hist_bins[bin_i]
 
+          data_point_weight = 1.0
+
           ∇loss  = ∇logloss(y[i], ŷ[i])
           ∇∇loss = ∇∇logloss(ŷ[i])
 
-          hist_bin.Σ∇loss  += ∇loss
-          hist_bin.Σ∇∇loss += ∇∇loss
+          hist_bin.Σ∇loss      += ∇loss
+          hist_bin.Σ∇∇loss     += ∇∇loss
+          hist_bin.data_weight += data_point_weight
 
-          this_leaf_Σ∇loss  += ∇loss
-          this_leaf_Σ∇∇loss += ∇∇loss
+          this_leaf_Σ∇loss      += ∇loss
+          this_leaf_Σ∇∇loss     += ∇∇loss
+          this_leaf_data_weight += data_point_weight
         end
 
         this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss)
 
-        left_Σ∇loss  = 0.0
-        left_Σ∇∇loss = 0.0
+        left_Σ∇loss      = 0.0
+        left_Σ∇∇loss     = 0.0
+        left_data_weight = 0.0
 
         for bin_i in UInt8(1):UInt8(max_bins-1)
           hist_bin = hist_bins[bin_i]
 
-          left_Σ∇loss  += hist_bin.Σ∇loss
-          left_Σ∇∇loss += hist_bin.Σ∇∇loss
+          left_Σ∇loss      += hist_bin.Σ∇loss
+          left_Σ∇∇loss     += hist_bin.Σ∇∇loss
+          left_data_weight += hist_bin.data_weight
 
-          right_Σ∇loss  = this_leaf_Σ∇loss  - left_Σ∇loss
-          right_Σ∇∇loss = this_leaf_Σ∇∇loss - left_Σ∇∇loss
+          right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
+          right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
+          right_data_weight = this_leaf_data_weight - left_data_weight
 
           expected_Δloss =
             -this_leaf_expected_Δloss +
             leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss) +
             leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss)
 
-          if expected_Δloss < best_expected_Δloss
+          if expected_Δloss < best_expected_Δloss && left_data_weight >= min_data_weight_in_leaf && right_data_weight >= min_data_weight_in_leaf
             best_expected_Δloss = expected_Δloss
             best_feature_i      = feature_i
             best_split_i        = bin_i
@@ -409,11 +422,11 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, config...)
     right_ys = y[right_is]
     right_ŷs = ŷ[right_is]
 
-    left_weight  = optimal_weight(left_ys,  left_ŷs)
-    right_weight = optimal_weight(right_ys, right_ŷs)
+    left_Δscore  = optimal_Δscore(left_ys,  left_ŷs)
+    right_Δscore = optimal_Δscore(right_ys, right_ŷs)
 
-    left_leaf  = Leaf(left_weight,  left_is,  nothing)
-    right_leaf = Leaf(right_weight, right_is, nothing)
+    left_leaf  = Leaf(left_Δscore,  left_is,  nothing)
+    right_leaf = Leaf(right_Δscore, right_is, nothing)
 
     new_node = Node(feature_i, split_i, left_leaf, right_leaf)
 

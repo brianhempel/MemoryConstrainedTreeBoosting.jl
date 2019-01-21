@@ -25,7 +25,7 @@ y = [0.0
      1.0
      1.0]
 
-(bin_splits, trees) = train(X, y, bin_count = 4, epoch_count = 20)
+(bin_splits, trees) = train(X, y, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0)
 
 bin_splits :: Vector{MagicTreeBoosting.BinSplits{Float32}}
 
