@@ -1,8 +1,10 @@
 module MagicTreeBoosting
 
-export train, train_one_epoch, apply_bin_splits, predict
+export train, train_one_epoch, apply_bins, predict, save, load
 
 import Random
+
+import BSON
 
 
 default_config = (
@@ -25,38 +27,59 @@ feature_count(X) = size(X,2)
 
 const ε = 1e-15 # Smallest Float64 power of 10 you can add to 1.0 and not round off to 1.0
 
+const Score      = Float64
+const Loss       = Float64
+const Prediction = Float64
+
 const BinSplits = Vector{T} where T <: AbstractFloat
 
-abstract type Tree{T <: AbstractFloat} end
+abstract type Tree end
 
-mutable struct SplitCandidate{T}
-  expected_Δloss :: T
+mutable struct SplitCandidate
+  expected_Δloss :: Loss
   feature_i      :: Int64
   split_i        :: UInt8
 end
 
-mutable struct HistBin{T}
-  Σ∇loss  :: T
-  Σ∇∇loss :: T
+mutable struct HistBin
+  Σ∇loss  :: Loss
+  Σ∇∇loss :: Loss
 
-  HistBin() = new{Float64}(0.0, 0.0)
+  HistBin() = new(0.0, 0.0)
 end
 
-mutable struct Node{T} <: Tree{T}
+mutable struct Node <: Tree
   feature_i :: Int64
   split_i   :: UInt8
-  left      :: Tree{T}
-  right     :: Tree{T}
+  left      :: Tree
+  right     :: Tree
 end
 
-mutable struct Leaf{T} <: Tree{T}
-  weight :: T
-  is :: Union{Vector{Int64},Nothing}                        # Transient. Needed during tree growing.
-  maybe_split_candidate :: Union{SplitCandidate{T},Nothing} # Transient. Needed during tree growing.
+mutable struct Leaf <: Tree
+  weight :: Score
+  is :: Union{Vector{Int64},Nothing}                     # Transient. Needed during tree growing.
+  maybe_split_candidate :: Union{SplitCandidate,Nothing} # Transient. Needed during tree growing.
 end
 
 
-function print_tree(tree :: Tree{T}, level) where T
+# Returns path
+function save(path, bin_splits, trees)
+  trees = map(strip_tree_training_info, trees)
+  # model = Model(bin_splits, trees)
+  BSON.@save path bin_splits trees
+  path
+end
+
+
+# Returns (bin_splits, trees)
+function load(path)
+  BSON.@load path bin_splits trees
+  FeatureType = typeof(bin_splits[1][1])
+  (Vector{BinSplits{FeatureType}}(bin_splits), Vector{Tree}(trees))
+end
+
+
+function print_tree(tree :: Tree, level)
   indentation = repeat("    ", level)
   if isa(tree, Node)
     println(indentation * "Node: feature_i $(tree.feature_i)\tsplit_i $(tree.split_i)")
@@ -68,7 +91,7 @@ function print_tree(tree :: Tree{T}, level) where T
 end
 
 
-function tree_leaves(tree :: Tree{T}) :: Vector{Leaf{T}} where T
+function tree_leaves(tree :: Tree) :: Vector{Leaf}
   if isa(tree, Leaf)
     [tree]
   else
@@ -90,6 +113,16 @@ function replace_leaf(tree, old, replacement)
   end
 end
 
+# Non-mutating. Returns a new tree with training info removed from the leaves.
+function strip_tree_training_info(tree :: Tree) :: Tree
+  if isa(tree, Node)
+    left  = strip_tree_training_info(tree.left)
+    right = strip_tree_training_info(tree.right)
+    Node(tree.feature_i, tree.split_i, left, right)
+  else
+    Leaf(tree.weight, nothing, nothing)
+  end
+end
 
 # Mutates and returns tree.
 function scale_leaf_weights(tree, learning_rate)
@@ -101,14 +134,14 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid).
-function apply_tree(X_binned :: Array{UInt8,2}, tree :: Tree{T}) :: Vector{T} where T
-  scores = zeros(T, data_count(X_binned))
+function apply_tree(X_binned :: Array{UInt8,2}, tree :: Tree) :: Vector{Score}
+  scores = zeros(Score, data_count(X_binned))
   apply_tree!(X_binned, tree, scores)
 end
 
 
 # Mutates scores.
-function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree{T}, scores :: Vector{T}) :: Vector{T} where T
+function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree, scores :: Vector) :: Vector
   for i in 1:data_count(X_binned)
     node = tree
     while !isa(node, Leaf)
@@ -126,8 +159,8 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
-function apply_trees(X_binned :: Array{UInt8,2}, trees :: Vector{Tree{T}}, starting_scores = nothing) :: Vector{T} where T
-  scores = zeros(T, data_count(X_binned))
+function apply_trees(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}, starting_scores = nothing) :: Vector{Score}
+  scores = zeros(Score, data_count(X_binned))
 
   if starting_scores != nothing
     scores += starting_scores
@@ -142,14 +175,14 @@ end
 
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict(X_binned :: Array{UInt8,2}, trees :: Vector{Tree{T}}, starting_scores = nothing) :: Vector{T} where T
+function predict(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}, starting_scores = nothing) :: Vector{Prediction}
   scores = apply_trees(X_binned, trees, starting_scores)
   σ.(scores)
 end
 
 
 # Aim for a roughly equal number of data points in each bin.
-function prepare_bin_splits(X, bin_count) :: Vector{BinSplits}
+function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count) :: Vector{BinSplits{FeatureType}} where FeatureType <: AbstractFloat
   if bin_count < 2 || bin_count > 255
     error("prepare_bin_splits: bin_count must be between 2 and 255")
   end
@@ -169,7 +202,7 @@ function prepare_bin_splits(X, bin_count) :: Vector{BinSplits}
         split_sample_i = Int64(floor(sample_count / bin_count * split_i))
         value_below_split = sorted_feature_values[split_sample_i]
         value_above_split = sorted_feature_values[min(split_sample_i + 1, sample_count)]
-        splits[split_i] = (value_below_split + value_above_split) / 2
+        splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coericing Float32 to Float64
       end
 
       splits
@@ -215,7 +248,7 @@ end
 
 
 # Trains for epoch_count rounds and teturns (bin_splits, prior_and_new_trees).
-function train(X, y; bin_splits=nothing, prior_trees=Tree{Float64}[], config...)
+function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
   if bin_splits == nothing
     bin_splits = prepare_bin_splits(X, get_config_field(config, :bin_count))
   end
