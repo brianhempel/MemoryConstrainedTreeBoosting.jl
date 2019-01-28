@@ -457,11 +457,12 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
       # Find best feature and split
       # Expected Δlogloss at leaf = -0.5 * (Σ ∇loss)² / (Σ ∇∇loss)
 
-      best_expected_Δloss = 0.0
-      best_feature_i      = 0
-      best_split_i        = UInt8(0)
+      # best_expected_Δloss, best_feature_i, best_split_i
+      thread_bests = map(_ -> (0.0, 0, UInt8(0)), 1:Threads.nthreads())
 
-      for feature_i in feature_is
+      Threads.@threads for feature_i in feature_is
+        best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
+
         max_bins = maximum(@view X_binned[:,feature_i])
 
         hist_bins = map(bin_i -> HistBin(), 1:max_bins)
@@ -522,9 +523,13 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
             best_expected_Δloss = expected_Δloss
             best_feature_i      = feature_i
             best_split_i        = bin_i
+
+            thread_bests[Threads.threadid()] = (best_expected_Δloss, best_feature_i, best_split_i)
           end
         end # for bin_i in 1:(max_bins-1)
       end # for feature_i in feature_is
+
+      best_expected_Δloss, best_feature_i, best_split_i = minimum(thread_bests)
 
       leaf.maybe_split_candidate = SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 
