@@ -1,6 +1,6 @@
 module MagicTreeBoosting
 
-export train, train_one_iteration, apply_bins, predict, save, load
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load
 
 import Random
 
@@ -11,8 +11,12 @@ default_config = (
   bin_count               = 255,
   iteration_count         = 10,
   min_data_weight_in_leaf = 10.0,
+  l2_regularization       = 1.0,
   max_leaves              = 32,
+  max_depth               = 6,
+  max_delta_score         = 1.0e10, # Before shrinkage.
   learning_rate           = 0.1,
+  feature_fraction        = 1.0, # Per tree.
 )
 
 function get_config_field(config, key)
@@ -94,11 +98,69 @@ function print_tree(tree :: Tree, level)
 end
 
 
+# Returns list of feature_i => appearance_count pairs, most common first.
+function feature_importance_by_appearance_count(trees :: Vector{Tree})
+  feature_i_to_count = Dict{Int64,Int64}()
+
+  for tree in trees
+    for split_node in tree_split_nodes(tree)
+      feature_i = split_node.feature_i
+      feature_i_to_count[feature_i] = 1 + get(feature_i_to_count, feature_i, 0)
+    end
+  end
+
+  sort(collect(feature_i_to_count), by=(kv -> -kv[2]))
+end
+
+
+# Returns list of feature_i => absolute_Δscore pairs, most important first.
+function feature_importance_by_absolute_delta_score(trees :: Vector{Tree})
+  feature_i_to_absolute_Δscore = Dict{Int64,Float64}()
+
+  for tree in trees
+    for split_node in tree_split_nodes(tree)
+      feature_i       = split_node.feature_i
+      leaves          = tree_leaves(split_node)
+      absolute_Δscore = sum(map(leaf -> abs(leaf.Δscore), leaves))
+
+      feature_i_to_absolute_Δscore[feature_i] = absolute_Δscore + get(feature_i_to_absolute_Δscore, feature_i, 0.0)
+    end
+  end
+
+  sort(collect(feature_i_to_absolute_Δscore), by=(kv -> -kv[2]))
+end
+
+
+function tree_split_nodes(tree :: Tree) :: Vector{Node}
+  if isa(tree, Leaf)
+    []
+  else
+    vcat([tree], tree_split_nodes(tree.left), tree_split_nodes(tree.right))
+  end
+end
+
 function tree_leaves(tree :: Tree) :: Vector{Leaf}
   if isa(tree, Leaf)
     [tree]
   else
     vcat(tree_leaves(tree.left), tree_leaves(tree.right))
+  end
+end
+
+
+function leaf_depth(tree :: Tree, leaf :: Leaf) :: Union{Int64,Nothing}
+  if tree === leaf
+    1
+  elseif isa(tree, Leaf)
+    nothing
+  else
+    left_depth = leaf_depth(tree.left, leaf)
+    if left_depth != nothing
+      left_depth + 1
+    else
+      right_depth = leaf_depth(tree.right, leaf)
+      right_depth == nothing ? nothing : right_depth + 1
+    end
   end
 end
 
@@ -230,8 +292,31 @@ function apply_bins(X, bin_splits) :: Array{UInt8,2}
     bin_count = length(splits_for_feature) + 1
     for i in 1:data_count(X)
       value   = X[i,j]
-      split_i = findfirst(split_value -> split_value > value, splits_for_feature)
-      bin_i   = split_i == nothing ? bin_count : split_i
+
+      jump_step = div(bin_count - 1, 2)
+      split_i   = 1
+
+      # Binary-ish jumping
+
+      # invariant: split_i > 1 implies split_i split <= value
+      while jump_step > 0
+        while jump_step > 0 && splits_for_feature[split_i + jump_step] > value
+          jump_step = div(jump_step, 2)
+        end
+        split_i += jump_step
+        jump_step = div(jump_step, 2)
+      end
+
+      bin_i = bin_count
+      for k in split_i:length(splits_for_feature)
+        if splits_for_feature[k] > value
+          bin_i = k
+          break
+        end
+      end
+
+      # split_i = findfirst(split_value -> split_value > value, @view splits_for_feature[split_i:length(splits_for_feature)])
+      # bin_i   = split_i == nothing ? bin_count : split_i
 
       X_binned[i,j] = UInt8(bin_i) # Store as 1-255 to match Julia indexing. We leave 0 unused but saves us from having to remember to convert.
     end
@@ -242,7 +327,12 @@ end
 
 
 function build_one_tree(X_binned :: Array{UInt8,2}, y, ŷ; config...) # y = labels, ŷ = predictions so far
-  tree = Leaf(optimal_Δscore(y, ŷ), collect(1:length(y)), nothing)
+  tree = Leaf(optimal_Δscore(y, ŷ, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing)
+
+  features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+
+  # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
+  feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
 
   tree_changed = true
 
@@ -250,7 +340,7 @@ function build_one_tree(X_binned :: Array{UInt8,2}, y, ŷ; config...) # y = labe
     # print_tree(tree, 0)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, feature_is; config...)
   end
 
   tree
@@ -260,13 +350,23 @@ end
 # Trains for iteration_count rounds and returns (bin_splits, prior_and_new_trees).
 function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
   if bin_splits == nothing
+    print("Preparing bin splits...")
     bin_splits = prepare_bin_splits(X, get_config_field(config, :bin_count))
+    println("done.")
   end
   # println(bin_splits)
 
+  print("Binning input data...")
   X_binned = apply_bins(X, bin_splits)
+  println("done.")
   # println(X_binned)
 
+  trees = train_on_binned(X_binned, y; prior_trees = prior_trees, config...)
+
+  (bin_splits, trees)
+end
+
+function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], config...) :: Vector{Tree}
   scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
 
   trees = []
@@ -278,10 +378,14 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
     iteration_loss = sum(logloss.(y, ŷ)) / length(y)
     # println(ŷ)
     println("Iteration $iteration_i training loss: $iteration_loss")
+
+    print_tree(tree, 0)
+    println()
+
     push!(trees, tree)
   end
 
-  (bin_splits, vcat(prior_trees, trees))
+  vcat(prior_trees, trees)
 end
 
 # Returns (new_scores, tree)
@@ -308,25 +412,27 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1 - y)*log(1 - ŷ + ε)
 
 
 # Assuming binary classification with log loss.
-function optimal_Δscore(y, ŷ)
+function optimal_Δscore(y, ŷ, l2_regularization, max_delta_score)
   Σ∇loss  = sum(∇logloss.(y, ŷ))
   Σ∇∇loss = sum(∇∇logloss.(ŷ))
 
-  # And the minima is at:
-  -Σ∇loss / (Σ∇∇loss + ε)
+  # And the loss minima is at:
+  clamp(-Σ∇loss / (Σ∇∇loss + l2_regularization + ε), -max_delta_score, max_delta_score)
 end
 
 
-# -0.5 * (Σ∇loss)² / (Σ∇∇loss)
-function leaf_expected_Δloss(Σ∇loss, Σ∇∇loss)
-  -0.5 * Σ∇loss * Σ∇loss / (Σ∇∇loss + ε)
+# -0.5 * (Σ∇loss)² / (Σ∇∇loss) in XGBoost paper; but can't simplify so much if clamping the score.
+function leaf_expected_Δloss(Σ∇loss, Σ∇∇loss, l2_regularization, max_delta_score)
+  Δscore = clamp(-Σ∇loss / (Σ∇∇loss + l2_regularization + ε), -max_delta_score, max_delta_score)
+
+  Σ∇loss * Δscore + 0.5 * Σ∇∇loss * Δscore * Δscore
 end
 
 
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ; config...)
+function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is; config...)
   leaves = tree_leaves(tree)
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -334,18 +440,24 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ; config...)
   end
 
   min_data_weight_in_leaf = get_config_field(config, :min_data_weight_in_leaf)
+  l2_regularization       = get_config_field(config, :l2_regularization)
+  max_delta_score         = get_config_field(config, :max_delta_score)
+
+  dont_split = SplitCandidate(0.0, 0, 0)
 
   # Ensure split_candidate on all leaves
   for leaf in leaves
-    if leaf.maybe_split_candidate == nothing
+    if leaf.maybe_split_candidate == nothing && leaf_depth(tree, leaf) >= get_config_field(config, :max_depth)
+      leaf.maybe_split_candidate = dont_split
+    elseif leaf.maybe_split_candidate == nothing
       # Find best feature and split
       # Expected Δlogloss at leaf = -0.5 * (Σ ∇loss)² / (Σ ∇∇loss)
 
       best_expected_Δloss = 0.0
-      best_feature_i      = 1
-      best_split_i        = UInt8(1)
+      best_feature_i      = 0
+      best_split_i        = UInt8(0)
 
-      for feature_i in 1:feature_count(X_binned)
+      for feature_i in feature_is
         max_bins = maximum(@view X_binned[:,feature_i])
 
         hist_bins = map(bin_i -> HistBin(), 1:max_bins)
@@ -372,7 +484,7 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ; config...)
           this_leaf_data_weight += data_point_weight
         end
 
-        this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss)
+        this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
 
         left_Σ∇loss      = 0.0
         left_Σ∇∇loss     = 0.0
@@ -385,22 +497,30 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ; config...)
           left_Σ∇∇loss     += hist_bin.Σ∇∇loss
           left_data_weight += hist_bin.data_weight
 
+          if left_data_weight < min_data_weight_in_leaf
+            continue
+          end
+
           right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
           right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
           right_data_weight = this_leaf_data_weight - left_data_weight
 
+          if right_data_weight < min_data_weight_in_leaf
+            break
+          end
+
           expected_Δloss =
             -this_leaf_expected_Δloss +
-            leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss) +
-            leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss)
+            leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
+            leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
 
-          if expected_Δloss < best_expected_Δloss && left_data_weight >= min_data_weight_in_leaf && right_data_weight >= min_data_weight_in_leaf
+          if expected_Δloss < best_expected_Δloss
             best_expected_Δloss = expected_Δloss
             best_feature_i      = feature_i
             best_split_i        = bin_i
           end
         end # for bin_i in 1:(max_bins-1)
-      end # for feature_i in 1:feature_count(X)
+      end # for feature_i in feature_is
 
       leaf.maybe_split_candidate = SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 
@@ -429,8 +549,8 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ; config...)
     right_ys = y[right_is]
     right_ŷs = ŷ[right_is]
 
-    left_Δscore  = optimal_Δscore(left_ys,  left_ŷs)
-    right_Δscore = optimal_Δscore(right_ys, right_ŷs)
+    left_Δscore  = optimal_Δscore(left_ys,  left_ŷs,  l2_regularization, max_delta_score)
+    right_Δscore = optimal_Δscore(right_ys, right_ŷs, l2_regularization, max_delta_score)
 
     left_leaf  = Leaf(left_Δscore,  left_is,  nothing)
     right_leaf = Leaf(right_Δscore, right_is, nothing)

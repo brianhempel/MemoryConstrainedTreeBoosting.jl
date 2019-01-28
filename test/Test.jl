@@ -41,4 +41,4 @@ trees      :: Vector{MagicTreeBoosting.Tree}
 
 X_binned = apply_bins(X, bin_splits)
 
-println(predict(X_binned, trees))
+println(predict_on_binned(X_binned, trees))
