@@ -225,14 +225,17 @@ end
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
 function apply_trees(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}, starting_scores = nothing) :: Vector{Score}
-  scores = zeros(Score, data_count(X_binned))
+
+  thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
+
+  Threads.@threads for tree in trees
+    apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
+  end
+
+  scores = sum(thread_scores)
 
   if starting_scores != nothing
     scores += starting_scores
-  end
-
-  for tree in trees
-    apply_tree!(X_binned, tree, scores)
   end
 
   scores
@@ -259,26 +262,27 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count) :: Vector{BinS
     error("prepare_bin_splits: bin_count must be between 2 and 255")
   end
   ideal_sample_count = bin_count * 1_000
-  is = collect(Iterators.take(Random.shuffle(1:data_count(X)), ideal_sample_count))
+  is = sort(collect(Iterators.take(Random.shuffle(1:data_count(X)), ideal_sample_count)))
 
   sample_count = length(is)
   split_count = bin_count - 1
 
-  bin_splits =
-    map(1:feature_count(X)) do j
-      sorted_feature_values = sort(X[is, j])
+  bin_splits = Vector{BinSplits{FeatureType}}(undef, feature_count(X))
 
-      splits = zeros(eltype(sorted_feature_values), split_count)
+  Threads.@threads for j in 1:feature_count(X)
+    sorted_feature_values = sort(X[is, j])
 
-      for split_i in 1:split_count
-        split_sample_i = Int64(floor(sample_count / bin_count * split_i))
-        value_below_split = sorted_feature_values[split_sample_i]
-        value_above_split = sorted_feature_values[min(split_sample_i + 1, sample_count)]
-        splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coericing Float32 to Float64
-      end
+    splits = zeros(eltype(sorted_feature_values), split_count)
 
-      splits
+    for split_i in 1:split_count
+      split_sample_i = Int64(floor(sample_count / bin_count * split_i))
+      value_below_split = sorted_feature_values[split_sample_i]
+      value_above_split = sorted_feature_values[min(split_sample_i + 1, sample_count)]
+      splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coericing Float32 to Float64
     end
+
+    bin_splits[j] = splits
+  end
 
   bin_splits
 end
@@ -287,7 +291,7 @@ end
 function apply_bins(X, bin_splits) :: Array{UInt8,2}
   X_binned = zeros(UInt8, size(X))
 
-  for j in 1:feature_count(X)
+  Threads.@threads for j in 1:feature_count(X)
     splits_for_feature = bin_splits[j]
     bin_count = length(splits_for_feature) + 1
     for i in 1:data_count(X)
@@ -382,7 +386,7 @@ function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], conf
     print_tree(tree, 0)
     println()
 
-    push!(trees, tree)
+    push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, saves memory if we strip off the list of indices
   end
 
   vcat(prior_trees, trees)
