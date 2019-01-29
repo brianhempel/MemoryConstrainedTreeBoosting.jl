@@ -18,6 +18,7 @@ default_config = (
   learning_rate           = 0.1,
   feature_fraction        = 1.0, # Per tree.
   feature_i_to_name       = nothing,
+  iteration_callback      = trees -> (),
 )
 
 function get_config_field(config, key)
@@ -250,16 +251,20 @@ end
 
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict(X, bin_splits, trees; starting_scores = nothing) :: Vector{Prediction}
+function predict(X, bin_splits, trees; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
   X_binned = apply_bins(X, bin_splits)
 
-  predict_on_binned(X_binned, trees, starting_scores = starting_scores)
+  predict_on_binned(X_binned, trees, starting_scores = starting_scores, output_raw_scores = output_raw_scores)
 end
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict_on_binned(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}; starting_scores = nothing) :: Vector{Prediction}
+function predict_on_binned(X_binned :: Array{UInt8,2}, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
   scores = apply_trees(X_binned, trees, starting_scores)
-  σ.(scores)
+  if output_raw_scores
+    scores
+  else
+    σ.(scores)
+  end
 end
 
 
@@ -348,7 +353,7 @@ function build_one_tree(X_binned :: Array{UInt8,2}, y, ŷ; config...) # y = labe
   tree_changed = true
 
   while tree_changed
-    # print_tree(tree, 0)
+    # print_tree(tree)
     # println()
     # println()
     (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, feature_is; config...)
@@ -380,7 +385,7 @@ end
 function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], config...) :: Vector{Tree}
   scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
 
-  trees = []
+  trees = Tree[]
 
   for iteration_i in 1:get_config_field(config, :iteration_count)
     (scores, tree) = train_one_iteration(X_binned, y, scores; config...)
@@ -393,7 +398,9 @@ function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], conf
     print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
     println()
 
-    push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, saves memory if we strip off the list of indices
+    push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, should save memory if we strip off the list of indices
+
+    get_config_field(config, :iteration_callback)(trees)
   end
 
   vcat(prior_trees, trees)
