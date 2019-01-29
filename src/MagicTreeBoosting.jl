@@ -475,72 +475,8 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
       thread_bests = map(_ -> (0.0, 0, UInt8(0)), 1:Threads.nthreads())
 
       Threads.@threads for feature_i in feature_is
-        best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
-
-        max_bins = maximum(@view X_binned[:,feature_i])
-
-        hist_bins = map(bin_i -> HistBin(), 1:max_bins)
-
-        this_leaf_Σ∇loss      = 0.0
-        this_leaf_Σ∇∇loss     = 0.0
-        this_leaf_data_weight = 0.0
-
-        for i in leaf.is
-          bin_i    = X_binned[i, feature_i]
-          hist_bin = hist_bins[bin_i]
-
-          data_point_weight = 1.0
-
-          ∇loss  = ∇logloss(y[i], ŷ[i])
-          ∇∇loss = ∇∇logloss(ŷ[i])
-
-          hist_bin.Σ∇loss      += ∇loss
-          hist_bin.Σ∇∇loss     += ∇∇loss
-          hist_bin.data_weight += data_point_weight
-
-          this_leaf_Σ∇loss      += ∇loss
-          this_leaf_Σ∇∇loss     += ∇∇loss
-          this_leaf_data_weight += data_point_weight
-        end
-
-        this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
-
-        left_Σ∇loss      = 0.0
-        left_Σ∇∇loss     = 0.0
-        left_data_weight = 0.0
-
-        for bin_i in UInt8(1):UInt8(max_bins-1)
-          hist_bin = hist_bins[bin_i]
-
-          left_Σ∇loss      += hist_bin.Σ∇loss
-          left_Σ∇∇loss     += hist_bin.Σ∇∇loss
-          left_data_weight += hist_bin.data_weight
-
-          if left_data_weight < min_data_weight_in_leaf
-            continue
-          end
-
-          right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
-          right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
-          right_data_weight = this_leaf_data_weight - left_data_weight
-
-          if right_data_weight < min_data_weight_in_leaf
-            break
-          end
-
-          expected_Δloss =
-            -this_leaf_expected_Δloss +
-            leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
-            leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
-
-          if expected_Δloss < best_expected_Δloss
-            best_expected_Δloss = expected_Δloss
-            best_feature_i      = feature_i
-            best_split_i        = bin_i
-
-            thread_bests[Threads.threadid()] = (best_expected_Δloss, best_feature_i, best_split_i)
-          end
-        end # for bin_i in 1:(max_bins-1)
+      # for feature_i in feature_is
+        perhaps_feature_is_best_split!(X_binned, y, ŷ, feature_i, leaf.is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
       end # for feature_i in feature_is
 
       best_expected_Δloss, best_feature_i, best_split_i = minimum(thread_bests)
@@ -586,6 +522,80 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
   else
     (false, tree)
   end
+end
+
+
+# Mutates thread_bests[Threads.threadid()]
+function perhaps_feature_is_best_split!(X_binned :: Array{UInt8,2}, y, ŷ, feature_i, leaf_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
+  best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
+
+  # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
+  max_bins = Int64(typemax(UInt8))
+
+  hist_bins = map(bin_i -> HistBin(), 1:max_bins)
+
+  this_leaf_Σ∇loss      = 0.0
+  this_leaf_Σ∇∇loss     = 0.0
+  this_leaf_data_weight = 0.0
+
+  for i in leaf_is
+    bin_i    = X_binned[i, feature_i]
+    hist_bin = hist_bins[bin_i]
+
+    data_point_weight = 1.0
+
+    ∇loss  = ∇logloss(y[i], ŷ[i])
+    ∇∇loss = ∇∇logloss(ŷ[i])
+
+    hist_bin.Σ∇loss      += ∇loss
+    hist_bin.Σ∇∇loss     += ∇∇loss
+    hist_bin.data_weight += data_point_weight
+
+    this_leaf_Σ∇loss      += ∇loss
+    this_leaf_Σ∇∇loss     += ∇∇loss
+    this_leaf_data_weight += data_point_weight
+  end
+
+  this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
+
+  left_Σ∇loss      = 0.0
+  left_Σ∇∇loss     = 0.0
+  left_data_weight = 0.0
+
+  for bin_i in UInt8(1):UInt8(max_bins-1)
+    hist_bin = hist_bins[bin_i]
+
+    left_Σ∇loss      += hist_bin.Σ∇loss
+    left_Σ∇∇loss     += hist_bin.Σ∇∇loss
+    left_data_weight += hist_bin.data_weight
+
+    if left_data_weight < min_data_weight_in_leaf
+      continue
+    end
+
+    right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
+    right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
+    right_data_weight = this_leaf_data_weight - left_data_weight
+
+    if right_data_weight < min_data_weight_in_leaf
+      break
+    end
+
+    expected_Δloss =
+      -this_leaf_expected_Δloss +
+      leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
+      leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
+
+    if expected_Δloss < best_expected_Δloss
+      best_expected_Δloss = expected_Δloss
+      best_feature_i      = feature_i
+      best_split_i        = bin_i
+
+      thread_bests[Threads.threadid()] = (best_expected_Δloss, best_feature_i, best_split_i)
+    end
+  end # for bin_i in 1:(max_bins-1)
+
+  ()
 end
 
 end # module MagicTreeBoosting
