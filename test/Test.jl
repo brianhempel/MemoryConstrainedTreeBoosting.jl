@@ -25,7 +25,7 @@ y = [0.0
      1.0
      1.0]
 
-(bin_splits, trees) = train(X, y, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0)
+(bin_splits, trees) = train(X, y, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
 
 bin_splits :: Vector{MagicTreeBoosting.BinSplits{Float32}}
 
@@ -42,3 +42,4 @@ trees      :: Vector{MagicTreeBoosting.Tree}
 X_binned = apply_bins(X, bin_splits)
 
 println(predict_on_binned(X_binned, trees))
+println(y)

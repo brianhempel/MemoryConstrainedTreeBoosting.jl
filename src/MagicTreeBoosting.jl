@@ -17,6 +17,7 @@ default_config = (
   max_delta_score         = 1.0e10, # Before shrinkage.
   learning_rate           = 0.1,
   feature_fraction        = 1.0, # Per tree.
+  feature_i_to_name       = nothing,
 )
 
 function get_config_field(config, key)
@@ -86,14 +87,20 @@ function load(path)
 end
 
 
-function print_tree(tree :: Tree, level)
+function print_tree(tree :: Tree, level = 0; feature_i_to_name = nothing)
   indentation = repeat("    ", level)
   if isa(tree, Node)
-    println(indentation * "Node: feature_i $(tree.feature_i)\tsplit_i $(tree.split_i)")
-    print_tree(tree.left,  level + 1)
-    print_tree(tree.right, level + 1)
+    feature_name =
+      if feature_i_to_name != nothing
+        feature_i_to_name(tree.feature_i)
+      else
+        "feature $(tree.feature_i)"
+      end
+    println(indentation * "$feature_name\tsplit at $(tree.split_i)")
+    print_tree(tree.left,  level + 1, feature_i_to_name = feature_i_to_name)
+    print_tree(tree.right, level + 1, feature_i_to_name = feature_i_to_name)
   else
-    println(indentation * "Leaf: Δscore $(tree.Δscore)\tis_count $(length(tree.is))")
+    println(indentation * "Δscore $(tree.Δscore)\t$(length(tree.is)) datapoints")
   end
 end
 
@@ -383,7 +390,7 @@ function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], conf
     # println(ŷ)
     println("Iteration $iteration_i training loss: $iteration_loss")
 
-    print_tree(tree, 0)
+    print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
     println()
 
     push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, saves memory if we strip off the list of indices
