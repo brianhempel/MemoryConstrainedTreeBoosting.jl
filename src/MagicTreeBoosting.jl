@@ -385,7 +385,7 @@ end
 function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], config...) :: Vector{Tree}
   scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
 
-  trees = Tree[]
+  trees = copy(prior_trees)
 
   for iteration_i in 1:get_config_field(config, :iteration_count)
     (scores, tree) = train_one_iteration(X_binned, y, scores; config...)
@@ -403,7 +403,7 @@ function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], conf
     get_config_field(config, :iteration_callback)(trees)
   end
 
-  vcat(prior_trees, trees)
+  trees
 end
 
 # Returns (new_scores, tree)
