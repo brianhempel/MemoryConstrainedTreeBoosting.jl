@@ -429,7 +429,7 @@ function finalize_loading(data_being_compressed :: DataBeingCompressed) :: Compr
   compressed_features = map(data_being_compressed.features_being_compressed) do feature_being_compressed
     write(feature_being_compressed.compression_stream, TranscodingStreams.TOKEN_END)
     flush(feature_being_compressed.compression_stream)
-    compressed_feature = take!(feature_being_compressed.buffer)
+    compressed_feature = take!(feature_being_compressed.buffer)[:]
     close(feature_being_compressed.compression_stream)
     compressed_feature
   end
