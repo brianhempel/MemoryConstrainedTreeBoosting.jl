@@ -44,7 +44,8 @@ mutable struct CompressedData
   compressed_features :: Vector{Vector{UInt8}}
 end
 
-mutable struct FeatureBeingCompressed  # Compression still active until data has all been appended.
+# FeatureBeingCompressed is used while data is still being prepared. Replaced by CompressedData (via finalize_loading) before training.
+mutable struct FeatureBeingCompressed
   buffer              :: IOBuffer
   compression_stream  :: CodecZstd.ZstdCompressorStream
 end
@@ -92,8 +93,8 @@ mutable struct Node <: Tree
 end
 
 mutable struct Leaf <: Tree
-  Δscore :: Score # Called "weight" in the literature
-  is :: Union{Vector{Int64},Nothing}                     # Transient. Needed during tree growing.
+  Δscore                :: Score # Called "weight" in the literature
+  is                    :: Union{Vector{Int64},Nothing}  # Transient. Needed during tree growing.
   maybe_split_candidate :: Union{SplitCandidate,Nothing} # Transient. Needed during tree growing.
 end
 
@@ -115,7 +116,7 @@ function load(path)
 end
 
 
-function print_tree(tree :: Tree, level = 0; feature_i_to_name = nothing)
+function print_tree(tree, level = 0; feature_i_to_name = nothing)
   indentation = repeat("    ", level)
   if isa(tree, Node)
     feature_name =
@@ -166,7 +167,7 @@ function feature_importance_by_absolute_delta_score(trees :: Vector{Tree})
 end
 
 
-function tree_split_nodes(tree :: Tree) :: Vector{Node}
+function tree_split_nodes(tree) :: Vector{Node}
   if isa(tree, Leaf)
     []
   else
@@ -174,7 +175,7 @@ function tree_split_nodes(tree :: Tree) :: Vector{Node}
   end
 end
 
-function tree_leaves(tree :: Tree) :: Vector{Leaf}
+function tree_leaves(tree) :: Vector{Leaf}
   if isa(tree, Leaf)
     [tree]
   else
@@ -183,7 +184,7 @@ function tree_leaves(tree :: Tree) :: Vector{Leaf}
 end
 
 
-function leaf_depth(tree :: Tree, leaf :: Leaf) :: Union{Int64,Nothing}
+function leaf_depth(tree, leaf) :: Union{Int64,Nothing}
   if tree === leaf
     1
   elseif isa(tree, Leaf)
@@ -214,7 +215,7 @@ function replace_leaf(tree, old, replacement)
 end
 
 # Non-mutating. Returns a new tree with training info removed from the leaves.
-function strip_tree_training_info(tree :: Tree) :: Tree
+function strip_tree_training_info(tree) :: Tree
   if isa(tree, Node)
     left  = strip_tree_training_info(tree.left)
     right = strip_tree_training_info(tree.right)
@@ -225,7 +226,7 @@ function strip_tree_training_info(tree :: Tree) :: Tree
 end
 
 # Mutates and returns tree.
-function scale_leaf_Δscores(tree, learning_rate)
+function scale_leaf_Δscores(tree, learning_rate) :: Tree
   for leaf in tree_leaves(tree)
     leaf.Δscore *= learning_rate
   end
@@ -241,7 +242,7 @@ end
 
 
 # Mutates scores.
-function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector) :: Vector
+function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   features_decompressed = Vector{Union{Nothing,AbstractArray}}(nothing, feature_count(X_binned))
 
   for i in 1:data_count(X_binned)
