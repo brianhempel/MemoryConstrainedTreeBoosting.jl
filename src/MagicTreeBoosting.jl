@@ -279,8 +279,8 @@ function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}, starting_scores 
 
   thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
 
-  # Threads.@threads for tree in trees
-  for tree in trees
+  Threads.@threads for tree in trees
+  # for tree in trees
     apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
   end
 
@@ -325,8 +325,8 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count) :: Vector{BinS
 
   bin_splits = Vector{BinSplits{FeatureType}}(undef, feature_count(X))
 
-  # Threads.@threads for j in 1:feature_count(X)
-  for j in 1:feature_count(X)
+  Threads.@threads for j in 1:feature_count(X)
+  # for j in 1:feature_count(X)
     sorted_feature_values = sort(X[is, j])
 
     splits = zeros(eltype(sorted_feature_values), split_count)
@@ -348,8 +348,8 @@ end
 function apply_bins(X, bin_splits) :: Array{UInt8,2}
   X_binned = zeros(UInt8, size(X))
 
-  # Threads.@threads for j in 1:feature_count(X)
-  for j in 1:feature_count(X)
+  Threads.@threads for j in 1:feature_count(X)
+  # for j in 1:feature_count(X)
     splits_for_feature = bin_splits[j]
     bin_count = length(splits_for_feature) + 1
     for i in 1:data_count(X)
@@ -404,7 +404,8 @@ function bin_and_compress(X, bin_splits; prior_data = nothing) :: DataBeingCompr
     data_being_compressed     = prior_data
   end
 
-  for feature_i in 1:feature_count(X)
+  Threads.@threads for feature_i in 1:feature_count(X)
+    # for feature_i in 1:feature_count(X)
     feature_being_compressed = features_being_compressed[feature_i]
     last_bin_i               = feature_being_compressed.last_bin_i
     chunk_to_compress        = Vector{UInt8}(undef, data_count(X))
@@ -581,8 +582,8 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...
       # best_expected_Δloss, best_feature_i, best_split_i
       thread_bests = map(_ -> (0.0, 0, UInt8(0)), 1:Threads.nthreads())
 
-      # Threads.@threads for feature_i in feature_is
-      for feature_i in feature_is
+      Threads.@threads for feature_i in feature_is
+      # for feature_i in feature_is
         perhaps_feature_is_best_split!(X_binned, y, ŷ, feature_i, leaf.is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
       end # for feature_i in feature_is
 
