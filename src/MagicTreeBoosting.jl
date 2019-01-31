@@ -1,6 +1,6 @@
 module MagicTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, bin_and_compress, apply_bins, predict, predict_on_binned, save, load
+export train, train_on_binned, prepare_bin_splits, bin_and_compress, finalize_loading, apply_bins, predict, predict_on_binned, save, load
 
 import Random
 
@@ -39,25 +39,24 @@ const DataWeight = Float64
 
 const BinSplits = Vector{T} where T <: AbstractFloat
 
-struct CompressedFeatureChunk
-  data_range      :: UnitRange{Int64}
-  compressed_data :: Vector{UInt8}
-end
-
-mutable struct CompressedFeature
-  decompressed_range :: UnitRange{Int64}
-  decompressed_chunk :: Vector{UInt8}
-  chunks             :: Vector{CompressedFeatureChunk}
-
-  CompressedFeature() = new(-1:-1, UInt8[], CompressedFeatureChunk[])
-end
-
 mutable struct CompressedData
   data_count          :: Int64
-  compressed_features :: Vector{CompressedFeature}
+  compressed_features :: Vector{Vector{UInt8}}
 end
 
-const Data = Union{Array{UInt8,2},CompressedData}
+# FeatureBeingCompressed is used while data is still being prepared. Replaced by CompressedData (via finalize_loading) before training.
+mutable struct FeatureBeingCompressed
+  buffer              :: IOBuffer
+  compression_stream  :: CodecZstd.ZstdCompressorStream
+end
+
+mutable struct DataBeingCompressed
+  data_count                :: Int64
+  features_being_compressed :: Vector{FeatureBeingCompressed}
+end
+
+const Data                  = Union{Array{UInt8,2},CompressedData}
+const DataOrDataBeingLoaded = Union{Data,DataBeingCompressed}
 # const Data = Array{UInt8,2}
 
 data_count(X :: Array{<:Number,2}) = size(X,1)
@@ -66,23 +65,8 @@ data_count(X :: CompressedData)    = X.data_count
 feature_count(X :: Array{<:Number,2}) = size(X,2)
 feature_count(X :: CompressedData)    = length(X.compressed_features)
 
-get_feature_bin(X_binned :: Array{UInt8,2}, i, feature_i) = X_binned[i, feature_i]
-get_feature_bin(X_binned :: CompressedData, i, feature_i) = begin
-  compressed_feature = X_binned.compressed_features[feature_i]
-
-  if !(i in compressed_feature.decompressed_range)
-    chunk_i = findfirst(chunk -> i in chunk.data_range, compressed_feature.chunks)
-    if chunk_i == nothing
-      error("Datapoint index $i not found in compressed feature $feature_i")
-    else
-      # print("Decompressing chunk $chunk_i of feature $feature_i\t")
-      compressed_feature.decompressed_range = compressed_feature.chunks[chunk_i].data_range
-      compressed_feature.decompressed_chunk = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, compressed_feature.chunks[chunk_i].compressed_data)
-    end
-  end
-
-  compressed_feature.decompressed_chunk[i - compressed_feature.decompressed_range.start + 1]
-end
+get_feature(X_binned :: Array{UInt8,2}, feature_i) = @view X_binned[:, feature_i]
+get_feature(X_binned :: CompressedData, feature_i) = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, X_binned.compressed_features[feature_i]) # Decompress the whole feature and return it.
 
 
 abstract type Tree end
@@ -265,7 +249,10 @@ function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) ::
     node = tree
     while !isa(node, Leaf)
       feature_i = node.feature_i
-      if get_feature_bin(X_binned, i, feature_i) <= node.split_i
+      if features_decompressed[feature_i] == nothing
+        features_decompressed[feature_i] = get_feature(X_binned, feature_i)
+      end
+      if features_decompressed[feature_i][i] <= node.split_i
         node = node.left
       else
         node = node.right
@@ -391,41 +378,56 @@ function apply_bins(X, bin_splits) :: Array{UInt8,2}
   X_binned
 end
 
-
-# Intended that you would call this multiple times. Each hunk passed ends up being a unit for decompression.
-# So some goldilocks principle applies. Aim for maybe 10-100 chunks total.
-function bin_and_compress(X, bin_splits; prior_data = nothing) :: CompressedData
+function bin_and_compress(X, bin_splits; prior_data = nothing) :: DataBeingCompressed
   X_binned = apply_bins(X, bin_splits)
 
   if prior_data == nothing
-    compressed_features = map(_ -> CompressedFeature(), 1:feature_count(X))
-    X_binned_compressed = CompressedData(0, compressed_features)
+    features_being_compressed =
+      map(1:feature_count(X)) do feature_i
+        buffer             = IOBuffer()
+        compression_stream = CodecZstd.ZstdCompressorStream(buffer)
+        FeatureBeingCompressed(buffer, compression_stream)
+      end
+
+    data_being_compressed = DataBeingCompressed(0, features_being_compressed)
   else
-    X_binned_compressed = prior_data
+    features_being_compressed = prior_data.features_being_compressed
+    data_being_compressed     = prior_data
   end
-
-  chunk_start = X_binned_compressed.data_count + 1
-  chunk_stop  = chunk_start + data_count(X) - 1
-
-  chunk_range = chunk_start:chunk_stop
 
   for feature_i in 1:feature_count(X)
-    chunk_compressed_data_take_1 = TranscodingStreams.transcode(CodecZstd.ZstdCompressor, X_binned[:,feature_i])
-    chunk_compressed_data_take_2 = chunk_compressed_data_take_1[:] # The first pass grows the arrays using doubling. That wastes space. Get the sizing right here.
-    chunk                        = CompressedFeatureChunk(chunk_range, chunk_compressed_data_take_2)
-
-    push!(X_binned_compressed.compressed_features[feature_i].chunks, chunk)
+    feature_being_compressed = features_being_compressed[feature_i]
+    write(feature_being_compressed.compression_stream, @view X_binned[:, feature_i])
+    flush(feature_being_compressed.compression_stream)
   end
 
-  X_binned_compressed.data_count = chunk_stop
+  data_being_compressed.data_count += data_count(X)
 
-  X_binned_compressed
+  data_being_compressed
+end
+
+# If training on compressed features, readout and close the compression streams.
+#
+# This should be done by the client. If we did it automatically, the client's GC will retain the DataBeingCompressed structs. (Which...might not be a problem depending on how the internal buffers work.)
+function finalize_loading(data_being_compressed :: DataBeingCompressed) :: CompressedData
+  compressed_features = map(data_being_compressed.features_being_compressed) do feature_being_compressed
+    write(feature_being_compressed.compression_stream, TranscodingStreams.TOKEN_END)
+    flush(feature_being_compressed.compression_stream)
+    compressed_feature = take!(feature_being_compressed.buffer)
+    close(feature_being_compressed.compression_stream)
+    compressed_feature
+  end
+
+  CompressedData(data_being_compressed.data_count, compressed_features)
+end
+
+function finalize_loading(X_binned :: Data)
+  X_binned
 end
 
 function compression_ratios(compressed_data :: CompressedData)
   map(compressed_data.compressed_features) do compressed_feature
-    feature_compressed_size = sum(map(chunk -> sizeof(chunk.compressed_data), compressed_feature.chunks))
-    compressed_data.data_count / feature_compressed_size
+    compressed_data.data_count / length(compressed_feature)
   end
 end
 
@@ -587,8 +589,10 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...
 
     # A bit of recalculation below but should be fine.
 
-    left_is  = filter(i -> get_feature_bin(X_binned, i, feature_i) <= split_i, leaf_to_split.is)
-    right_is = filter(i -> get_feature_bin(X_binned, i, feature_i) >  split_i, leaf_to_split.is)
+    feature_binned = get_feature(X_binned, feature_i)
+
+    left_is  = filter(i -> feature_binned[i] <= split_i, leaf_to_split.is)
+    right_is = filter(i -> feature_binned[i] >  split_i, leaf_to_split.is)
 
     left_ys  = y[left_is]
     left_ŷs  = ŷ[left_is]
@@ -624,8 +628,10 @@ function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, feature_i, leaf
   this_leaf_Σ∇∇loss     = 0.0
   this_leaf_data_weight = 0.0
 
+  feature_binned = get_feature(X_binned, feature_i)
+
   for i in leaf_is
-    bin_i    = get_feature_bin(X_binned, i, feature_i)
+    bin_i    = feature_binned[i]
     hist_bin = hist_bins[bin_i]
 
     data_point_weight = 1.0
