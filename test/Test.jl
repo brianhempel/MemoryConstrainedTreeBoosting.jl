@@ -43,3 +43,12 @@ X_binned = apply_bins(X, bin_splits)
 
 println(predict_on_binned(X_binned, trees))
 println(y)
+
+bin_splits          = prepare_bin_splits(X, 4)
+X_binned_compressed = bin_and_compress(X[1:3,:], bin_splits)
+X_binned_compressed = bin_and_compress(X[4:10,:], bin_splits, prior_data = X_binned_compressed)
+
+trees = train_on_binned(X_binned_compressed, y, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
+
+println(predict_on_binned(X_binned_compressed, trees))
+println(y)

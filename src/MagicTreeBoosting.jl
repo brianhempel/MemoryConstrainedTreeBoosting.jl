@@ -1,10 +1,11 @@
 module MagicTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load
+export train, train_on_binned, prepare_bin_splits, bin_and_compress, apply_bins, predict, predict_on_binned, save, load
 
 import Random
 
 import BSON
+import TranscodingStreams, CodecZstd
 
 
 default_config = (
@@ -29,9 +30,6 @@ function get_config_field(config, key)
   end
 end
 
-data_count(X)    = size(X,1)
-feature_count(X) = size(X,2)
-
 const ε = 1e-15 # Smallest Float64 power of 10 you can add to 1.0 and not round off to 1.0
 
 const Score      = Float64
@@ -40,6 +38,52 @@ const Prediction = Float64
 const DataWeight = Float64
 
 const BinSplits = Vector{T} where T <: AbstractFloat
+
+struct CompressedFeatureChunk
+  data_range      :: UnitRange{Int64}
+  compressed_data :: Vector{UInt8}
+end
+
+mutable struct CompressedFeature
+  decompressed_range :: UnitRange{Int64}
+  decompressed_chunk :: Vector{UInt8}
+  chunks             :: Vector{CompressedFeatureChunk}
+
+  CompressedFeature() = new(-1:-1, UInt8[], CompressedFeatureChunk[])
+end
+
+mutable struct CompressedData
+  data_count          :: Int64
+  compressed_features :: Vector{CompressedFeature}
+end
+
+const Data = Union{Array{UInt8,2},CompressedData}
+# const Data = Array{UInt8,2}
+
+data_count(X :: Array{<:Number,2}) = size(X,1)
+data_count(X :: CompressedData)    = X.data_count
+
+feature_count(X :: Array{<:Number,2}) = size(X,2)
+feature_count(X :: CompressedData)    = length(X.compressed_features)
+
+get_feature_bin(X_binned :: Array{UInt8,2}, i, feature_i) = X_binned[i, feature_i]
+get_feature_bin(X_binned :: CompressedData, i, feature_i) = begin
+  compressed_feature = X_binned.compressed_features[feature_i]
+
+  if !(i in compressed_feature.decompressed_range)
+    chunk_i = findfirst(chunk -> i in chunk.data_range, compressed_feature.chunks)
+    if chunk_i == nothing
+      error("Datapoint index $i not found in compressed feature $feature_i")
+    else
+      # print("Decompressing chunk $chunk_i of feature $feature_i\t")
+      compressed_feature.decompressed_range = compressed_feature.chunks[chunk_i].data_range
+      compressed_feature.decompressed_chunk = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, compressed_feature.chunks[chunk_i].compressed_data)
+    end
+  end
+
+  compressed_feature.decompressed_chunk[i - compressed_feature.decompressed_range.start + 1]
+end
+
 
 abstract type Tree end
 
@@ -207,20 +251,21 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid).
-function apply_tree(X_binned :: Array{UInt8,2}, tree :: Tree) :: Vector{Score}
+function apply_tree(X_binned :: Data, tree :: Tree) :: Vector{Score}
   scores = zeros(Score, data_count(X_binned))
   apply_tree!(X_binned, tree, scores)
 end
 
 
 # Mutates scores.
-function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
+function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   features_decompressed = Vector{Union{Nothing,AbstractArray}}(nothing, feature_count(X_binned))
 
   for i in 1:data_count(X_binned)
     node = tree
     while !isa(node, Leaf)
-      if X_binned[i, node.feature_i] <= node.split_i
+      feature_i = node.feature_i
+      if get_feature_bin(X_binned, i, feature_i) <= node.split_i
         node = node.left
       else
         node = node.right
@@ -234,11 +279,12 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
-function apply_trees(X_binned :: Array{UInt8,2}, trees :: Vector{Tree}, starting_scores = nothing) :: Vector{Score}
+function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}, starting_scores = nothing) :: Vector{Score}
 
   thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
 
-  Threads.@threads for tree in trees
+  # Threads.@threads for tree in trees
+  for tree in trees
     apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
   end
 
@@ -260,7 +306,7 @@ function predict(X, bin_splits, trees; starting_scores = nothing, output_raw_sco
 end
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict_on_binned(X_binned :: Array{UInt8,2}, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
+function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
   scores = apply_trees(X_binned, trees, starting_scores)
   if output_raw_scores
     scores
@@ -283,13 +329,14 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count) :: Vector{BinS
 
   bin_splits = Vector{BinSplits{FeatureType}}(undef, feature_count(X))
 
-  Threads.@threads for j in 1:feature_count(X)
+  # Threads.@threads for j in 1:feature_count(X)
+  for j in 1:feature_count(X)
     sorted_feature_values = sort(X[is, j])
 
     splits = zeros(eltype(sorted_feature_values), split_count)
 
     for split_i in 1:split_count
-      split_sample_i = Int64(floor(sample_count / bin_count * split_i))
+      split_sample_i = max(1, Int64(floor(sample_count / bin_count * split_i)))
       value_below_split = sorted_feature_values[split_sample_i]
       value_above_split = sorted_feature_values[min(split_sample_i + 1, sample_count)]
       splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coericing Float32 to Float64
@@ -305,7 +352,8 @@ end
 function apply_bins(X, bin_splits) :: Array{UInt8,2}
   X_binned = zeros(UInt8, size(X))
 
-  Threads.@threads for j in 1:feature_count(X)
+  # Threads.@threads for j in 1:feature_count(X)
+  for j in 1:feature_count(X)
     splits_for_feature = bin_splits[j]
     bin_count = length(splits_for_feature) + 1
     for i in 1:data_count(X)
@@ -344,7 +392,44 @@ function apply_bins(X, bin_splits) :: Array{UInt8,2}
 end
 
 
-function build_one_tree(X_binned :: Array{UInt8,2}, y, ŷ; config...) # y = labels, ŷ = predictions so far
+# Intended that you would call this multiple times. Each hunk passed ends up being a unit for decompression.
+# So some goldilocks principle applies. Aim for maybe 10-100 chunks total.
+function bin_and_compress(X, bin_splits; prior_data = nothing) :: CompressedData
+  X_binned = apply_bins(X, bin_splits)
+
+  if prior_data == nothing
+    compressed_features = map(_ -> CompressedFeature(), 1:feature_count(X))
+    X_binned_compressed = CompressedData(0, compressed_features)
+  else
+    X_binned_compressed = prior_data
+  end
+
+  chunk_start = X_binned_compressed.data_count + 1
+  chunk_stop  = chunk_start + data_count(X) - 1
+
+  chunk_range = chunk_start:chunk_stop
+
+  for feature_i in 1:feature_count(X)
+    chunk_compressed_data_take_1 = TranscodingStreams.transcode(CodecZstd.ZstdCompressor, X_binned[:,feature_i])
+    chunk_compressed_data_take_2 = chunk_compressed_data_take_1[:] # The first pass grows the arrays using doubling. That wastes space. Get the sizing right here.
+    chunk                        = CompressedFeatureChunk(chunk_range, chunk_compressed_data_take_2)
+
+    push!(X_binned_compressed.compressed_features[feature_i].chunks, chunk)
+  end
+
+  X_binned_compressed.data_count = chunk_stop
+
+  X_binned_compressed
+end
+
+function compression_ratios(compressed_data :: CompressedData)
+  map(compressed_data.compressed_features) do compressed_feature
+    feature_compressed_size = sum(map(chunk -> sizeof(chunk.compressed_data), compressed_feature.chunks))
+    compressed_data.data_count / feature_compressed_size
+  end
+end
+
+function build_one_tree(X_binned :: Data, y, ŷ; config...) # y = labels, ŷ = predictions so far
   tree = Leaf(optimal_Δscore(y, ŷ, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing)
 
   features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
@@ -384,7 +469,7 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
   (bin_splits, trees)
 end
 
-function train_on_binned(X_binned :: Array{UInt8,2}, y; prior_trees=Tree[], config...) :: Vector{Tree}
+function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
   scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
 
   trees = copy(prior_trees)
@@ -452,7 +537,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is; config...)
+function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...)
   leaves = tree_leaves(tree)
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -476,8 +561,8 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
       # best_expected_Δloss, best_feature_i, best_split_i
       thread_bests = map(_ -> (0.0, 0, UInt8(0)), 1:Threads.nthreads())
 
-      Threads.@threads for feature_i in feature_is
-      # for feature_i in feature_is
+      # Threads.@threads for feature_i in feature_is
+      for feature_i in feature_is
         perhaps_feature_is_best_split!(X_binned, y, ŷ, feature_i, leaf.is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
       end # for feature_i in feature_is
 
@@ -502,8 +587,8 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
 
     # A bit of recalculation below but should be fine.
 
-    left_is  = filter(i -> X_binned[i,feature_i] <= split_i, leaf_to_split.is)
-    right_is = filter(i -> X_binned[i,feature_i] >  split_i, leaf_to_split.is)
+    left_is  = filter(i -> get_feature_bin(X_binned, i, feature_i) <= split_i, leaf_to_split.is)
+    right_is = filter(i -> get_feature_bin(X_binned, i, feature_i) >  split_i, leaf_to_split.is)
 
     left_ys  = y[left_is]
     left_ŷs  = ŷ[left_is]
@@ -526,9 +611,8 @@ function perhaps_split_tree(tree, X_binned :: Array{UInt8,2}, y, ŷ, feature_is;
   end
 end
 
-
 # Mutates thread_bests[Threads.threadid()]
-function perhaps_feature_is_best_split!(X_binned :: Array{UInt8,2}, y, ŷ, feature_i, leaf_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
+function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, feature_i, leaf_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
   best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
 
   # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
@@ -541,7 +625,7 @@ function perhaps_feature_is_best_split!(X_binned :: Array{UInt8,2}, y, ŷ, featu
   this_leaf_data_weight = 0.0
 
   for i in leaf_is
-    bin_i    = X_binned[i, feature_i]
+    bin_i    = get_feature_bin(X_binned, i, feature_i)
     hist_bin = hist_bins[bin_i]
 
     data_point_weight = 1.0
