@@ -505,9 +505,9 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
       println()
 
       push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, should save memory if we strip off the list of indices
-    end
 
-    get_config_field(config, :iteration_callback)(trees)
+      get_config_field(config, :iteration_callback)(trees)
+    end
   end
 
   trees
