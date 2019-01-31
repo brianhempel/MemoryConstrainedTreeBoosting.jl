@@ -46,8 +46,11 @@ end
 
 # FeatureBeingCompressed is used while data is still being prepared. Replaced by CompressedData (via finalize_loading) before training.
 mutable struct FeatureBeingCompressed
+  last_bin_i          :: UInt8
   buffer              :: IOBuffer
   compression_stream  :: CodecZstd.ZstdCompressorStream
+
+  FeatureBeingCompressed(buffer, compression_stream) = new(0x00, buffer, compression_stream)
 end
 
 mutable struct DataBeingCompressed
@@ -66,7 +69,13 @@ feature_count(X :: Array{<:Number,2}) = size(X,2)
 feature_count(X :: CompressedData)    = length(X.compressed_features)
 
 get_feature(X_binned :: Array{UInt8,2}, feature_i) = @view X_binned[:, feature_i]
-get_feature(X_binned :: CompressedData, feature_i) = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, X_binned.compressed_features[feature_i]) # Decompress the whole feature and return it.
+get_feature(X_binned :: CompressedData, feature_i) = begin
+  out = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, X_binned.compressed_features[feature_i]) # Decompress the whole feature and return it.
+  for i in 2:data_count(X_binned)
+    out[i] += out[i-1] # Undo the delta encoding.
+  end
+  out
+end
 
 
 abstract type Tree end
@@ -397,7 +406,14 @@ function bin_and_compress(X, bin_splits; prior_data = nothing) :: DataBeingCompr
 
   for feature_i in 1:feature_count(X)
     feature_being_compressed = features_being_compressed[feature_i]
-    write(feature_being_compressed.compression_stream, @view X_binned[:, feature_i])
+    last_bin_i               = feature_being_compressed.last_bin_i
+    chunk_to_compress        = Vector{UInt8}(undef, data_count(X))
+    for i in 1:data_count(X)
+      chunk_to_compress[i] = X_binned[i, feature_i] - last_bin_i
+      last_bin_i           = X_binned[i, feature_i]
+    end
+    feature_being_compressed.last_bin_i = last_bin_i
+    write(feature_being_compressed.compression_stream, chunk_to_compress)
     flush(feature_being_compressed.compression_stream)
   end
 
