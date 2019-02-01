@@ -9,6 +9,7 @@ import TranscodingStreams, CodecZstd
 
 
 default_config = (
+  weights                 = nothing, # weights for the data
   bin_count               = 255,
   iteration_count         = 10,
   min_data_weight_in_leaf = 10.0,
@@ -313,6 +314,7 @@ end
 
 
 # Aim for a roughly equal number of data points in each bin.
+# Does not support weights.
 function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count) :: Vector{BinSplits{FeatureType}} where FeatureType <: AbstractFloat
   if bin_count < 2 || bin_count > 255
     error("prepare_bin_splits: bin_count must be between 2 and 255")
@@ -335,7 +337,7 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count) :: Vector{BinS
       split_sample_i = max(1, Int64(floor(sample_count / bin_count * split_i)))
       value_below_split = sorted_feature_values[split_sample_i]
       value_above_split = sorted_feature_values[min(split_sample_i + 1, sample_count)]
-      splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coericing Float32 to Float64
+      splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coercing Float32 to Float64
     end
 
     bin_splits[j] = splits
@@ -448,8 +450,8 @@ function compression_ratios(compressed_data :: CompressedData)
   end
 end
 
-function build_one_tree(X_binned :: Data, y, ŷ; config...) # y = labels, ŷ = predictions so far
-  tree = Leaf(optimal_Δscore(y, ŷ, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing)
+function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
+  tree = Leaf(optimal_Δscore(y, ŷ, weights, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing)
 
   features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
 
@@ -462,7 +464,7 @@ function build_one_tree(X_binned :: Data, y, ŷ; config...) # y = labels, ŷ = p
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, feature_is; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, weights, feature_is; config...)
   end
 
   tree
@@ -493,12 +495,17 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   trees = copy(prior_trees)
 
+  weights = get_config_field(config, :weights)
+  if weights == nothing
+    weights = map(_ -> 1.0, y)
+  end
+
   for iteration_i in 1:get_config_field(config, :iteration_count)
     @time begin
-      (scores, tree) = train_one_iteration(X_binned, y, scores; config...)
+      (scores, tree) = train_one_iteration(X_binned, y, weights, scores; config...)
 
       ŷ = σ.(scores)
-      iteration_loss = sum(logloss.(y, ŷ)) / length(y)
+      iteration_loss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
       # println(ŷ)
       println("Iteration $iteration_i training loss: $iteration_loss")
 
@@ -515,10 +522,10 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 end
 
 # Returns (new_scores, tree)
-function train_one_iteration(X_binned, y, scores; config...)
+function train_one_iteration(X_binned, y, weights, scores; config...)
   ŷ = σ.(scores)
   # println(ŷ)
-  tree = build_one_tree(X_binned, y, ŷ; config...)
+  tree = build_one_tree(X_binned, y, ŷ, weights; config...)
   tree = scale_leaf_Δscores(tree, get_config_field(config, :learning_rate))
   new_scores = scores .+ apply_tree(X_binned, tree)
   (new_scores, tree)
@@ -538,9 +545,9 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1 - y)*log(1 - ŷ + ε)
 
 
 # Assuming binary classification with log loss.
-function optimal_Δscore(y, ŷ, l2_regularization, max_delta_score)
-  Σ∇loss  = sum(∇logloss.(y, ŷ))
-  Σ∇∇loss = sum(∇∇logloss.(ŷ))
+function optimal_Δscore(y, ŷ, weights, l2_regularization, max_delta_score)
+  Σ∇loss  = sum(∇logloss.(y, ŷ) .* weights)
+  Σ∇∇loss = sum(∇∇logloss.(ŷ)   .* weights)
 
   # And the loss minima is at:
   clamp(-Σ∇loss / (Σ∇∇loss + l2_regularization + ε), -max_delta_score, max_delta_score)
@@ -558,7 +565,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...)
+function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; config...)
   leaves = tree_leaves(tree)
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -584,7 +591,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...
 
       Threads.@threads for feature_i in feature_is
       # for feature_i in feature_is
-        perhaps_feature_is_best_split!(X_binned, y, ŷ, feature_i, leaf.is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
+        perhaps_feature_is_best_split!(X_binned, y, ŷ, weights, feature_i, leaf.is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
       end # for feature_i in feature_is
 
       best_expected_Δloss, best_feature_i, best_split_i = minimum(thread_bests)
@@ -613,13 +620,15 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...
     left_is  = filter(i -> feature_binned[i] <= split_i, leaf_to_split.is)
     right_is = filter(i -> feature_binned[i] >  split_i, leaf_to_split.is)
 
-    left_ys  = y[left_is]
-    left_ŷs  = ŷ[left_is]
-    right_ys = y[right_is]
-    right_ŷs = ŷ[right_is]
+    left_ys       = y[left_is]
+    left_ŷs       = ŷ[left_is]
+    right_ys      = y[right_is]
+    right_ŷs      = ŷ[right_is]
+    left_weights  = weights[left_is]
+    right_weights = weights[right_is]
 
-    left_Δscore  = optimal_Δscore(left_ys,  left_ŷs,  l2_regularization, max_delta_score)
-    right_Δscore = optimal_Δscore(right_ys, right_ŷs, l2_regularization, max_delta_score)
+    left_Δscore  = optimal_Δscore(left_ys,  left_ŷs,  left_weights,  l2_regularization, max_delta_score)
+    right_Δscore = optimal_Δscore(right_ys, right_ŷs, right_weights, l2_regularization, max_delta_score)
 
     left_leaf  = Leaf(left_Δscore,  left_is,  nothing)
     right_leaf = Leaf(right_Δscore, right_is, nothing)
@@ -635,7 +644,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, feature_is; config...
 end
 
 # Mutates thread_bests[Threads.threadid()]
-function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, feature_i, leaf_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
+function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, weights, feature_i, leaf_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
   best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
 
   # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
@@ -653,10 +662,10 @@ function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, feature_i, leaf
     bin_i    = feature_binned[i]
     hist_bin = hist_bins[bin_i]
 
-    data_point_weight = 1.0
+    data_point_weight = weights[i]
 
-    ∇loss  = ∇logloss(y[i], ŷ[i])
-    ∇∇loss = ∇∇logloss(ŷ[i])
+    ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
+    ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
 
     hist_bin.Σ∇loss      += ∇loss
     hist_bin.Σ∇∇loss     += ∇∇loss

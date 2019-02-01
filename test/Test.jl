@@ -25,7 +25,20 @@ y = [0.0
      1.0
      1.0]
 
-(bin_splits, trees) = train(X, y, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
+weights = [10.0
+           0.1
+           0.1
+           1.0
+           1.0
+           1.0
+           1.0
+           1.0
+           10.0
+           1.0]
+
+# weights = weights ./ weights
+
+(bin_splits, trees) = train(X, y, weights = weights, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
 
 bin_splits :: Vector{MagicTreeBoosting.BinSplits{Float32}}
 
@@ -49,7 +62,7 @@ X_binned_compressed = bin_and_compress(X[1:3,:], bin_splits)
 X_binned_compressed = bin_and_compress(X[4:10,:], bin_splits, prior_data = X_binned_compressed)
 X_binned_compressed = finalize_loading(X_binned_compressed)
 
-trees = train_on_binned(X_binned_compressed, y, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
+trees = train_on_binned(X_binned_compressed, y, weights = weights, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
 
 println(predict_on_binned(X_binned_compressed, trees))
 println(y)
