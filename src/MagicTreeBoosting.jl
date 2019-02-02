@@ -3,6 +3,7 @@ module MagicTreeBoosting
 export train, train_on_binned, prepare_bin_splits, bin_and_compress, finalize_loading, apply_bins, predict, predict_on_binned, save, load
 
 import Random
+import Statistics
 
 import BSON
 import TranscodingStreams, CodecZstd
@@ -19,6 +20,7 @@ default_config = (
   max_delta_score         = 1.0e10, # Before shrinkage.
   learning_rate           = 0.1,
   feature_fraction        = 1.0, # Per tree.
+  random_strength         = 0.0, # Relative standard deviation of noise added to the expected loss improvement of each split. Affects split randomization. Decays throughout training. If using, start with a value of 0.1.
   feature_i_to_name       = nothing,
   iteration_callback      = trees -> (),
 )
@@ -86,6 +88,8 @@ mutable struct SplitCandidate
   feature_i      :: Int64
   split_i        :: UInt8
 end
+
+const dont_split = SplitCandidate(0.0, 0, 0)
 
 mutable struct HistBin
   Σ∇loss      :: Loss
@@ -469,26 +473,6 @@ function compression_ratios(compressed_data :: CompressedData)
   end
 end
 
-function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
-  tree = Leaf(optimal_Δscore(y, ŷ, weights, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing, [])
-
-  features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
-
-  # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
-  feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
-
-  tree_changed = true
-
-  while tree_changed
-    # print_tree(tree)
-    # println()
-    # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, weights, feature_is; config...)
-  end
-
-  tree
-end
-
 
 # Trains for iteration_count rounds and returns (bin_splits, prior_and_new_trees).
 function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
@@ -521,7 +505,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   for iteration_i in 1:get_config_field(config, :iteration_count)
     @time begin
-      (scores, tree) = train_one_iteration(X_binned, y, weights, scores; config...)
+      (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
 
       ŷ = σ.(scores)
       iteration_loss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
@@ -540,14 +524,76 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
   trees
 end
 
+
 # Returns (new_scores, tree)
-function train_one_iteration(X_binned, y, weights, scores; config...)
+function train_one_iteration(X_binned, y, weights, scores, prior_tree_count; config...)
   ŷ = σ.(scores)
   # println(ŷ)
-  tree = build_one_tree(X_binned, y, ŷ, weights; config...)
-  tree = scale_leaf_Δscores(tree, get_config_field(config, :learning_rate))
+
+  learning_rate   = get_config_field(config, :learning_rate)
+  random_strength = get_config_field(config, :random_strength)
+
+  split_expected_Δloss_noise_std_dev = begin
+    if random_strength == 0.0
+      0.0
+    else
+      l2_regularization = get_config_field(config, :l2_regularization)
+      max_delta_score   = get_config_field(config, :max_delta_score)
+
+      # Not how Catboost does it, but this seems the most reasonable baseline given how we calculate improvements.
+
+      Δloss_if_each_datapoint_got_its_own_leaf = 0.0
+      for i in 1:data_count(X_binned)
+        ∇loss  = ∇logloss(y[i], ŷ[i]) * weights[i]
+        ∇∇loss = ∇∇logloss(ŷ[i])      * weights[i]
+
+        Δloss_if_each_datapoint_got_its_own_leaf += leaf_expected_Δloss(∇loss, ∇∇loss, l2_regularization / data_count(X_binned), max_delta_score)
+      end
+
+      # # This decay schedule is from Catboost, https://github.com/catboost/catboost/blob/master/catboost/cuda/methods/random_score_helper.h#L18-L22
+      # decay_multiplier = begin
+      #   model_size     = prior_tree_count * learning_rate
+      #   log_data_count = log(data_count(X_binned))
+      #   model_left     = exp(log_data_count - model_size)
+      #
+      #   model_left / (1.0 + model_left)
+      # end
+
+      # Catboost's decay schedule doesn't make sense. We start overfitting at a model size of 5-10, not at a model size of log(sample_count).
+      decay_multiplier = begin
+        model_size = prior_tree_count * learning_rate
+        0.01^(model_size / 5.0)
+      end
+
+      Δloss_if_each_datapoint_got_its_own_leaf * decay_multiplier * random_strength
+    end
+  end
+
+  tree = build_one_tree(X_binned, y, ŷ, weights, split_expected_Δloss_noise_std_dev; config...)
+  tree = scale_leaf_Δscores(tree, learning_rate)
   new_scores = scores .+ apply_tree(X_binned, tree)
   (new_scores, tree)
+end
+
+
+function build_one_tree(X_binned :: Data, y, ŷ, weights, split_expected_Δloss_noise_std_dev; config...) # y = labels, ŷ = predictions so far
+  tree = Leaf(optimal_Δscore(y, ŷ, weights, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing, [])
+
+  features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+
+  # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
+  feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
+
+  tree_changed = true
+
+  while tree_changed
+    # print_tree(tree)
+    # println()
+    # println()
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, weights, feature_is, split_expected_Δloss_noise_std_dev; config...)
+  end
+
+  tree
 end
 
 
@@ -584,7 +630,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; config...)
+function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, split_expected_Δloss_noise_std_dev; config...)
   leaves = tree_leaves(tree)
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -595,18 +641,13 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
   l2_regularization       = get_config_field(config, :l2_regularization)
   max_delta_score         = get_config_field(config, :max_delta_score)
 
-  dont_split = SplitCandidate(0.0, 0, 0)
-
   # Ensure split_candidate on all leaves
   for leaf in leaves
     if leaf.maybe_split_candidate == nothing && leaf_depth(tree, leaf) >= get_config_field(config, :max_depth)
       leaf.maybe_split_candidate = dont_split
     elseif leaf.maybe_split_candidate == nothing
-      # Find best feature and split
+      # Find best feature and best split
       # Expected Δlogloss at leaf = -0.5 * (Σ ∇loss)² / (Σ ∇∇loss)
-
-      # best_expected_Δloss, best_feature_i, best_split_i
-      thread_bests = map(_ -> (0.0, 0, UInt8(0)), 1:Threads.nthreads())
 
       if isempty(leaf.features_hist_bins)
         leaf.features_hist_bins = map(_ -> HistBin[], 1:feature_count(X_binned))
@@ -614,13 +655,10 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
 
       Threads.@threads for feature_i in feature_is
       # for feature_i in feature_is
-        perhaps_feature_is_best_split!(X_binned, y, ŷ, weights, feature_i, tree, leaf, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
-      end # for feature_i in feature_is
+        calculate_feature_histogram!(X_binned, y, ŷ, weights, feature_i, tree, leaf)
+      end
 
-      best_expected_Δloss, best_feature_i, best_split_i = minimum(thread_bests)
-
-      leaf.maybe_split_candidate = SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
-
+      leaf.maybe_split_candidate = find_best_split(leaf.features_hist_bins, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, split_expected_Δloss_noise_std_dev)
     end # if leaf.maybe_split_candidate == nothing
   end # for leaf in leaves
 
@@ -666,11 +704,9 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
   end
 end
 
-# Mutates thread_bests[Threads.threadid()] and leaf.features_hist_bins
-function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
-  best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
+# Calculates and sets leaf.features_hist_bins[feature_i]
+function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf)
 
-  # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
   max_bins = Int64(typemax(UInt8))
 
   # If the parent cached its hist_bins, and the other sibling has already done its calculation, then we can calculate our hist_bins by simple subtraction.
@@ -714,56 +750,72 @@ function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, weights, featur
 
   leaf.features_hist_bins[feature_i] = hist_bins
 
-  this_leaf_Σ∇loss      = 0.0
-  this_leaf_Σ∇∇loss     = 0.0
-  this_leaf_data_weight = 0.0
-
-  for bin_i in UInt8(1):UInt8(max_bins-1)
-    this_leaf_Σ∇loss      += hist_bins[bin_i].Σ∇loss
-    this_leaf_Σ∇∇loss     += hist_bins[bin_i].Σ∇∇loss
-    this_leaf_data_weight += hist_bins[bin_i].data_weight
-  end
-
-  this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
-
-  left_Σ∇loss      = 0.0
-  left_Σ∇∇loss     = 0.0
-  left_data_weight = 0.0
-
-  for bin_i in UInt8(1):UInt8(max_bins-1)
-    hist_bin = hist_bins[bin_i]
-
-    left_Σ∇loss      += hist_bin.Σ∇loss
-    left_Σ∇∇loss     += hist_bin.Σ∇∇loss
-    left_data_weight += hist_bin.data_weight
-
-    if left_data_weight < min_data_weight_in_leaf
-      continue
-    end
-
-    right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
-    right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
-    right_data_weight = this_leaf_data_weight - left_data_weight
-
-    if right_data_weight < min_data_weight_in_leaf
-      break
-    end
-
-    expected_Δloss =
-      -this_leaf_expected_Δloss +
-      leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
-      leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
-
-    if expected_Δloss < best_expected_Δloss
-      best_expected_Δloss = expected_Δloss
-      best_feature_i      = feature_i
-      best_split_i        = bin_i
-
-      thread_bests[Threads.threadid()] = (best_expected_Δloss, best_feature_i, best_split_i)
-    end
-  end # for bin_i in 1:(max_bins-1)
-
   ()
+end
+
+# Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
+function find_best_split(features_hist_bins, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, split_expected_Δloss_noise_std_dev)
+  # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
+  max_bins = Int64(typemax(UInt8))
+
+  best_expected_Δloss, best_feature_i, best_split_i = (0.0, 0, UInt8(0))
+
+  # This should be fast enough that threading won't help, because it's only O(max_bins*feature_count).
+
+  for feature_i in feature_is
+    hist_bins = features_hist_bins[feature_i]
+
+    this_leaf_Σ∇loss      = 0.0
+    this_leaf_Σ∇∇loss     = 0.0
+    this_leaf_data_weight = 0.0
+
+    for bin_i in UInt8(1):UInt8(max_bins-1)
+      this_leaf_Σ∇loss      += hist_bins[bin_i].Σ∇loss
+      this_leaf_Σ∇∇loss     += hist_bins[bin_i].Σ∇∇loss
+      this_leaf_data_weight += hist_bins[bin_i].data_weight
+    end
+
+    this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
+
+    left_Σ∇loss      = 0.0
+    left_Σ∇∇loss     = 0.0
+    left_data_weight = 0.0
+
+    for bin_i in UInt8(1):UInt8(max_bins-1)
+      hist_bin = hist_bins[bin_i]
+
+      left_Σ∇loss      += hist_bin.Σ∇loss
+      left_Σ∇∇loss     += hist_bin.Σ∇∇loss
+      left_data_weight += hist_bin.data_weight
+
+      if left_data_weight < min_data_weight_in_leaf
+        continue
+      end
+
+      right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
+      right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
+      right_data_weight = this_leaf_data_weight - left_data_weight
+
+      if right_data_weight < min_data_weight_in_leaf
+        break
+      end
+
+      expected_Δloss =
+        -this_leaf_expected_Δloss +
+        leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
+        leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
+
+      expected_Δloss += randn() * split_expected_Δloss_noise_std_dev
+
+      if expected_Δloss < best_expected_Δloss
+        best_expected_Δloss = expected_Δloss
+        best_feature_i      = feature_i
+        best_split_i        = bin_i
+      end
+    end # for bin_i in 1:(max_bins-1)
+  end # for feature_i in feature_is
+
+  SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 end
 
 end # module MagicTreeBoosting
