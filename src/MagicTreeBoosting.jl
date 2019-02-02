@@ -112,6 +112,8 @@ mutable struct Leaf <: Tree
   is                    :: Union{Vector{Int64},Nothing}  # Transient. Needed during tree growing.
   maybe_split_candidate :: Union{SplitCandidate,Nothing} # Transient. Needed during tree growing.
   features_hist_bins    :: Vector{Vector{HistBin}}       # Transient. Used to speed up tree calculation.
+
+  Leaf(Δscore, is = nothing, maybe_split_candidate = nothing, features_hist_bins = []) = new(Δscore, is, maybe_split_candidate, features_hist_bins)
 end
 
 
