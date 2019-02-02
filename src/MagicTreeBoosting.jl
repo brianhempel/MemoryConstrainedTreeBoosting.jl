@@ -96,16 +96,18 @@ mutable struct HistBin
 end
 
 mutable struct Node <: Tree
-  feature_i :: Int64
-  split_i   :: UInt8
-  left      :: Tree
-  right     :: Tree
+  feature_i          :: Int64
+  split_i            :: UInt8
+  left               :: Tree
+  right              :: Tree
+  features_hist_bins :: Vector{Vector{HistBin}} # Transient. Used to speed up tree calculation.
 end
 
 mutable struct Leaf <: Tree
   Δscore                :: Score # Called "weight" in the literature
   is                    :: Union{Vector{Int64},Nothing}  # Transient. Needed during tree growing.
   maybe_split_candidate :: Union{SplitCandidate,Nothing} # Transient. Needed during tree growing.
+  features_hist_bins    :: Vector{Vector{HistBin}}       # Transient. Used to speed up tree calculation.
 end
 
 
@@ -193,6 +195,23 @@ function tree_leaves(tree) :: Vector{Leaf}
   end
 end
 
+function parent_node(tree, target) :: Union{Node,Nothing}
+  if isa(tree, Leaf)
+    nothing
+  elseif tree.left === target
+    tree
+  elseif tree.right === target
+    tree
+  else
+    parent_in_left = parent_node(tree.left, target)
+    if parent_in_left != nothing
+      parent_in_left
+    else
+      parent_node(tree.right, target)
+    end
+  end
+end
+
 
 function leaf_depth(tree, leaf) :: Union{Int64,Nothing}
   if tree === leaf
@@ -229,9 +248,9 @@ function strip_tree_training_info(tree) :: Tree
   if isa(tree, Node)
     left  = strip_tree_training_info(tree.left)
     right = strip_tree_training_info(tree.right)
-    Node(tree.feature_i, tree.split_i, left, right)
+    Node(tree.feature_i, tree.split_i, left, right, [])
   else
-    Leaf(tree.Δscore, nothing, nothing)
+    Leaf(tree.Δscore, nothing, nothing, [])
   end
 end
 
@@ -451,7 +470,7 @@ function compression_ratios(compressed_data :: CompressedData)
 end
 
 function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
-  tree = Leaf(optimal_Δscore(y, ŷ, weights, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing)
+  tree = Leaf(optimal_Δscore(y, ŷ, weights, get_config_field(config, :l2_regularization), get_config_field(config, :max_delta_score)), collect(1:length(y)), nothing, [])
 
   features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
 
@@ -589,9 +608,13 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
       # best_expected_Δloss, best_feature_i, best_split_i
       thread_bests = map(_ -> (0.0, 0, UInt8(0)), 1:Threads.nthreads())
 
+      if isempty(leaf.features_hist_bins)
+        leaf.features_hist_bins = map(_ -> HistBin[], 1:feature_count(X_binned))
+      end
+
       Threads.@threads for feature_i in feature_is
       # for feature_i in feature_is
-        perhaps_feature_is_best_split!(X_binned, y, ŷ, weights, feature_i, leaf.is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
+        perhaps_feature_is_best_split!(X_binned, y, ŷ, weights, feature_i, tree, leaf, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
       end # for feature_i in feature_is
 
       best_expected_Δloss, best_feature_i, best_split_i = minimum(thread_bests)
@@ -630,10 +653,10 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
     left_Δscore  = optimal_Δscore(left_ys,  left_ŷs,  left_weights,  l2_regularization, max_delta_score)
     right_Δscore = optimal_Δscore(right_ys, right_ŷs, right_weights, l2_regularization, max_delta_score)
 
-    left_leaf  = Leaf(left_Δscore,  left_is,  nothing)
-    right_leaf = Leaf(right_Δscore, right_is, nothing)
+    left_leaf  = Leaf(left_Δscore,  left_is,  nothing, [])
+    right_leaf = Leaf(right_Δscore, right_is, nothing, [])
 
-    new_node = Node(feature_i, split_i, left_leaf, right_leaf)
+    new_node = Node(feature_i, split_i, left_leaf, right_leaf, leaf_to_split.features_hist_bins)
 
     tree = replace_leaf(tree, leaf_to_split, new_node)
 
@@ -643,37 +666,62 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
   end
 end
 
-# Mutates thread_bests[Threads.threadid()]
-function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, weights, feature_i, leaf_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
+# Mutates thread_bests[Threads.threadid()] and leaf.features_hist_bins
+function perhaps_feature_is_best_split!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf, min_data_weight_in_leaf, l2_regularization, max_delta_score, thread_bests)
   best_expected_Δloss, best_feature_i, best_split_i = thread_bests[Threads.threadid()]
 
   # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
   max_bins = Int64(typemax(UInt8))
 
-  hist_bins = map(bin_i -> HistBin(), 1:max_bins)
+  # If the parent cached its hist_bins, and the other sibling has already done its calculation, then we can calculate our hist_bins by simple subtraction.
+  parent = parent_node(tree, leaf)
+  if parent != nothing
+    sibling = (parent.left === leaf ? parent.right : parent.left)
+  end
+
+  if parent != nothing && !isempty(parent.features_hist_bins) && !isempty(parent.features_hist_bins[feature_i]) && !isempty(sibling.features_hist_bins) && !isempty(sibling.features_hist_bins[feature_i])
+    # Expediated hist bin calculation.
+    parent_hist_bins  = parent.features_hist_bins[feature_i]
+    sibling_hist_bins = sibling.features_hist_bins[feature_i]
+
+    hist_bins = map(zip(parent_hist_bins, sibling_hist_bins)) do (parent_hist_bin, sibling_hist_bin)
+      hist_bin = HistBin()
+      hist_bin.Σ∇loss      = parent_hist_bin.Σ∇loss      - sibling_hist_bin.Σ∇loss
+      hist_bin.Σ∇∇loss     = parent_hist_bin.Σ∇∇loss     - sibling_hist_bin.Σ∇∇loss
+      hist_bin.data_weight = parent_hist_bin.data_weight - sibling_hist_bin.data_weight
+      hist_bin
+    end
+  else
+    # Can't expediate hist_bin calculation.
+    hist_bins = map(bin_i -> HistBin(), 1:max_bins)
+
+    feature_binned = get_feature(X_binned, feature_i)
+
+    for i in leaf.is
+      bin_i    = feature_binned[i]
+      hist_bin = hist_bins[bin_i]
+
+      data_point_weight = weights[i]
+
+      ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
+      ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
+
+      hist_bin.Σ∇loss      += ∇loss
+      hist_bin.Σ∇∇loss     += ∇∇loss
+      hist_bin.data_weight += data_point_weight
+    end
+  end
+
+  leaf.features_hist_bins[feature_i] = hist_bins
 
   this_leaf_Σ∇loss      = 0.0
   this_leaf_Σ∇∇loss     = 0.0
   this_leaf_data_weight = 0.0
 
-  feature_binned = get_feature(X_binned, feature_i)
-
-  for i in leaf_is
-    bin_i    = feature_binned[i]
-    hist_bin = hist_bins[bin_i]
-
-    data_point_weight = weights[i]
-
-    ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
-    ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
-
-    hist_bin.Σ∇loss      += ∇loss
-    hist_bin.Σ∇∇loss     += ∇∇loss
-    hist_bin.data_weight += data_point_weight
-
-    this_leaf_Σ∇loss      += ∇loss
-    this_leaf_Σ∇∇loss     += ∇∇loss
-    this_leaf_data_weight += data_point_weight
+  for bin_i in UInt8(1):UInt8(max_bins-1)
+    this_leaf_Σ∇loss      += hist_bins[bin_i].Σ∇loss
+    this_leaf_Σ∇∇loss     += hist_bins[bin_i].Σ∇∇loss
+    this_leaf_data_weight += hist_bins[bin_i].data_weight
   end
 
   this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
