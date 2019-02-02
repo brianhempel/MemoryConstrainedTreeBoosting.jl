@@ -20,10 +20,12 @@ default_config = (
   max_delta_score         = 1.0e10, # Before shrinkage.
   learning_rate           = 0.1,
   feature_fraction        = 1.0, # Per tree.
-  random_strength         = 0.0, # Relative standard deviation of noise added to the expected loss improvement of each split. Affects split randomization. Decays throughout training. If using, start with a value of 0.1.
+  bagging_temperature     = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
+  random_strength         = 0.0, # Inspired by Catboost. Relative standard deviation of noise added to the expected loss improvement of each split. Affects split randomization. Decays throughout training. If using, start with a value of 0.01 - 0.2.
   feature_i_to_name       = nothing,
   iteration_callback      = trees -> (),
 )
+
 
 function get_config_field(config, key)
   if !isa(config, Tuple{}) && haskey(config, key)
@@ -532,8 +534,24 @@ function train_one_iteration(X_binned, y, weights, scores, prior_tree_count; con
   ŷ = σ.(scores)
   # println(ŷ)
 
-  learning_rate   = get_config_field(config, :learning_rate)
-  random_strength = get_config_field(config, :random_strength)
+  learning_rate       = get_config_field(config, :learning_rate)
+  bagging_temperature = get_config_field(config, :bagging_temperature)
+  random_strength     = get_config_field(config, :random_strength)
+
+  weights =
+    # Adapted from Catboost
+    if bagging_temperature > 0.0
+      map(weights) do weight
+        r = -log(rand() + ε)
+        if bagging_temperature != 1.0
+          weight * r^bagging_temperature
+        else
+          weight * r
+        end
+      end
+    else
+      weights
+    end
 
   split_expected_Δloss_noise_std_dev = begin
     if random_strength == 0.0
