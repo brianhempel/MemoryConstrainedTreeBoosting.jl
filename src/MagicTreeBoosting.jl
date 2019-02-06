@@ -651,7 +651,7 @@ end
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
 function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, split_expected_Δloss_noise_std_dev; config...)
-  leaves = tree_leaves(tree)
+  leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
 
   if length(leaves) >= get_config_field(config, :max_leaves)
     return (false, tree)
