@@ -508,16 +508,17 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
   end
 
   for iteration_i in 1:get_config_field(config, :iteration_count)
-    @time begin
+    # @time begin
+    begin
       (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
 
       ŷ = σ.(scores)
       iteration_loss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
       # println(ŷ)
-      println("Iteration $iteration_i training loss: $iteration_loss")
+      # println("Iteration $iteration_i training loss: $iteration_loss")
 
-      print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
-      println()
+      # print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
+      # println()
 
       push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, should save memory if we strip off the list of indices
 
