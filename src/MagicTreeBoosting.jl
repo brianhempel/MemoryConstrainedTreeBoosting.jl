@@ -77,7 +77,7 @@ feature_count(X :: CompressedData)    = length(X.compressed_features)
 get_feature(X_binned :: Array{UInt8,2}, feature_i) = @view X_binned[:, feature_i]
 get_feature(X_binned :: CompressedData, feature_i) = begin
   out = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, X_binned.compressed_features[feature_i]) # Decompress the whole feature and return it.
-  for i in 2:data_count(X_binned)
+  @inbounds for i in 2:data_count(X_binned)
     out[i] += out[i-1] # Undo the delta encoding.
   end
   out
@@ -279,16 +279,19 @@ end
 
 # Mutates scores.
 function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
-  for i in 1:data_count(X_binned)
-    node = tree
-    while !isa(node, Leaf)
-      if X_binned[i, node.feature_i] <= node.split_i
-        node = node.left
-      else
-        node = node.right
+  Threads.@threads for i in 1:data_count(X_binned)
+  # for i in 1:data_count(X_binned)
+    @inbounds begin
+      node = tree
+      while !isa(node, Leaf)
+        if X_binned[i, node.feature_i] <= node.split_i
+          node = node.left
+        else
+          node = node.right
+        end
       end
+      scores[i] += node.Δscore
     end
-    scores[i] += node.Δscore
   end
 
   scores
@@ -297,7 +300,8 @@ end
 function apply_tree!(X_binned :: CompressedData, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   features_decompressed = Vector{Union{Nothing,AbstractArray}}(nothing, feature_count(X_binned))
 
-  for i in 1:data_count(X_binned)
+  # No threading yet.
+  @inbounds for i in 1:data_count(X_binned)
     node = tree
     while !isa(node, Leaf)
       feature_i = node.feature_i
@@ -320,14 +324,16 @@ end
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
 function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}, starting_scores = nothing) :: Vector{Score}
 
-  thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
+  # thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
+  scores = zeros(Score, data_count(X_binned))
 
-  Threads.@threads for tree in trees
-  # for tree in trees
-    apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
+  # Threads.@threads for tree in trees
+  for tree in trees
+    # apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
+    apply_tree!(X_binned, tree, scores)
   end
 
-  scores = sum(thread_scores)
+  # scores = sum(thread_scores)
 
   if starting_scores != nothing
     scores += starting_scores
@@ -396,7 +402,7 @@ function apply_bins(X, bin_splits) :: Array{UInt8,2}
   # for j in 1:feature_count(X)
     splits_for_feature = bin_splits[j]
     bin_count = length(splits_for_feature) + 1
-    for i in 1:data_count(X)
+    @inbounds for i in 1:data_count(X)
       value   = X[i,j]
 
       jump_step = div(bin_count - 1, 2)
@@ -453,7 +459,7 @@ function bin_and_compress(X, bin_splits; prior_data = nothing) :: DataBeingCompr
     feature_being_compressed = features_being_compressed[feature_i]
     last_bin_i               = feature_being_compressed.last_bin_i
     chunk_to_compress        = Vector{UInt8}(undef, data_count(X))
-    for i in 1:data_count(X)
+    @inbounds for i in 1:data_count(X)
       chunk_to_compress[i] = X_binned[i, feature_i] - last_bin_i
       last_bin_i           = X_binned[i, feature_i]
     end
@@ -579,7 +585,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
       # Not how Catboost does it, but this seems the most reasonable baseline given how we calculate improvements.
 
       Δloss_if_each_datapoint_got_its_own_leaf = 0.0f0
-      for i in 1:data_count(X_binned)
+      @inbounds for i in 1:data_count(X_binned)
         ∇loss  = ∇logloss(y[i], ŷ[i]) * weights[i]
         ∇∇loss = ∇∇logloss(ŷ[i])      * weights[i]
 
@@ -607,7 +613,8 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
 
   tree = build_one_tree(X_binned, y, ŷ, weights, split_expected_Δloss_noise_std_dev; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
-  new_scores = scores .+ apply_tree(X_binned, tree)
+  new_scores = copy(scores)
+  apply_tree!(X_binned, tree, new_scores)
   (new_scores, tree)
 end
 
@@ -718,6 +725,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, 
 
     feature_binned = get_feature(X_binned, feature_i)
 
+    # Can't seem to get it faster than this version.
     left_is  = filter(i -> feature_binned[i] <= split_i, leaf_to_split.is)
     right_is = filter(i -> feature_binned[i] >  split_i, leaf_to_split.is)
 
@@ -775,7 +783,7 @@ function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_
 
     leaf_is = leaf.is
 
-    for ii in 1:3:(length(leaf.is)-2)
+    @inbounds for ii in 1:3:(length(leaf.is)-2)
       i1 = leaf_is[ii]
       i2 = leaf_is[ii+1]
       i3 = leaf_is[ii+2]
@@ -814,7 +822,7 @@ function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_
       # data_weights[bin_i4] += data_point_weight4
     end
 
-    for ii in ((1:3:(length(leaf.is)-2)).stop + 3):length(leaf.is)
+    @inbounds for ii in ((1:3:(length(leaf.is)-2)).stop + 3):length(leaf.is)
       i = leaf_is[ii]
       bin_i = feature_binned[i]
 
@@ -858,7 +866,7 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
     left_Σ∇∇loss     = 0.0f0
     left_data_weight = 0.0f0
 
-    for bin_i in UInt8(1):UInt8(max_bins-1)
+    @inbounds for bin_i in UInt8(1):UInt8(max_bins-1)
       left_Σ∇loss      += Σ∇losses[bin_i]
       left_Σ∇∇loss     += Σ∇∇losses[bin_i]
       left_data_weight += data_weights[bin_i]
