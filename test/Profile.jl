@@ -1,7 +1,7 @@
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
 import Random
-using MagicTreeBoosting
+using MemoryConstrainedTreeBoosting
 
 using Profile
 
@@ -11,12 +11,14 @@ feature_count = 150
 point_count   = 12_000_000
 
 X       = randn(Float32, (point_count, feature_count))
-y       = round.(rand(MagicTreeBoosting.Prediction, point_count))
-weights = rand(MagicTreeBoosting.DataWeight, point_count)
+y       = round.(rand(MemoryConstrainedTreeBoosting.Prediction, point_count))
+weights = rand(MemoryConstrainedTreeBoosting.DataWeight, point_count)
 
 
 bin_splits = prepare_bin_splits(X)
 X_binned   = apply_bins(X, bin_splits)
+# X_binned   = bin_and_compress(X, bin_splits)
+# X_binned   = finalize_loading(X_binned_compressed)
 
 trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5)
 

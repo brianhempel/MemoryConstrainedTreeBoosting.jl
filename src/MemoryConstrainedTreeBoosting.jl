@@ -1,4 +1,4 @@
-module MagicTreeBoosting
+module MemoryConstrainedTreeBoosting
 
 export train, train_on_binned, prepare_bin_splits, bin_and_compress, finalize_loading, apply_bins, predict, predict_on_binned, save, load
 
@@ -298,23 +298,27 @@ function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree, scores :: Vector{
 end
 # Mutates scores.
 function apply_tree!(X_binned :: CompressedData, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
+  feature_is = unique(map(node -> node.feature_i, tree_split_nodes(tree)))
   features_decompressed = Vector{Union{Nothing,AbstractArray}}(nothing, feature_count(X_binned))
 
+  Threads.@threads for feature_i in feature_is
+    features_decompressed[feature_i] = get_feature(X_binned, feature_i)
+  end
+
   # No threading yet.
-  @inbounds for i in 1:data_count(X_binned)
-    node = tree
-    while !isa(node, Leaf)
-      feature_i = node.feature_i
-      if features_decompressed[feature_i] == nothing
-        features_decompressed[feature_i] = get_feature(X_binned, feature_i)
+  Threads.@threads for i in 1:data_count(X_binned)
+    @inbounds begin
+      node = tree
+      while !isa(node, Leaf)
+        feature_i = node.feature_i
+        if features_decompressed[feature_i][i] <= node.split_i
+          node = node.left
+        else
+          node = node.right
+        end
       end
-      if features_decompressed[feature_i][i] <= node.split_i
-        node = node.left
-      else
-        node = node.right
-      end
+      scores[i] += node.Δscore
     end
-    scores[i] += node.Δscore
   end
 
   scores
@@ -901,4 +905,4 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
   SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 end
 
-end # module MagicTreeBoosting
+end # module MemoryConstrainedTreeBoosting

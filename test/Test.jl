@@ -1,6 +1,6 @@
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
-using MagicTreeBoosting
+using MemoryConstrainedTreeBoosting
 
 # 10x3 array
 X = Float32[0.314421   0.622812  0.758382
@@ -40,7 +40,7 @@ weights = Float32[10.0
 
 (bin_splits, trees) = train(X, y, weights = weights, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
 
-bin_splits :: Vector{MagicTreeBoosting.BinSplits{Float32}}
+bin_splits :: Vector{MemoryConstrainedTreeBoosting.BinSplits{Float32}}
 
 save_path = tempname()
 
@@ -49,8 +49,8 @@ save(save_path, bin_splits, trees)
 bin_splits, trees = load(save_path)
 
 # Make sure load gives the types back correctly.
-bin_splits :: Vector{MagicTreeBoosting.BinSplits{Float32}}
-trees      :: Vector{MagicTreeBoosting.Tree}
+bin_splits :: Vector{MemoryConstrainedTreeBoosting.BinSplits{Float32}}
+trees      :: Vector{MemoryConstrainedTreeBoosting.Tree}
 
 X_binned = apply_bins(X, bin_splits)
 
