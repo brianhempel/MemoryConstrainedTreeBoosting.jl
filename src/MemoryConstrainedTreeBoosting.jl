@@ -1,12 +1,10 @@
 module MemoryConstrainedTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, bin_and_compress, finalize_loading, apply_bins, predict, predict_on_binned, save, load
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load
 
 import Random
-import Statistics
 
 import BSON
-import TranscodingStreams, CodecZstd
 
 
 default_config = (
@@ -45,43 +43,13 @@ const DataWeight = Float32
 
 const BinSplits = Vector{T} where T <: AbstractFloat
 
-mutable struct CompressedData
-  data_count          :: Int64
-  compressed_features :: Vector{Vector{UInt8}}
-end
-
-# FeatureBeingCompressed is used while data is still being prepared. Replaced by CompressedData (via finalize_loading) before training.
-mutable struct FeatureBeingCompressed
-  last_bin_i          :: UInt8
-  buffer              :: IOBuffer
-  compression_stream  :: CodecZstd.ZstdCompressorStream
-
-  FeatureBeingCompressed(buffer, compression_stream) = new(0x00, buffer, compression_stream)
-end
-
-mutable struct DataBeingCompressed
-  data_count                :: Int64
-  features_being_compressed :: Vector{FeatureBeingCompressed}
-end
-
-const Data                  = Union{Array{UInt8,2},CompressedData}
-const DataOrDataBeingLoaded = Union{Data,DataBeingCompressed}
-# const Data = Array{UInt8,2}
+const Data = Array{UInt8,2}
 
 data_count(X :: Array{<:Number,2}) = size(X,1)
-data_count(X :: CompressedData)    = X.data_count
 
 feature_count(X :: Array{<:Number,2}) = size(X,2)
-feature_count(X :: CompressedData)    = length(X.compressed_features)
 
-get_feature(X_binned :: Array{UInt8,2}, feature_i) = @view X_binned[:, feature_i]
-get_feature(X_binned :: CompressedData, feature_i) = begin
-  out = TranscodingStreams.transcode(CodecZstd.ZstdDecompressor, X_binned.compressed_features[feature_i]) # Decompress the whole feature and return it.
-  @inbounds for i in 2:data_count(X_binned)
-    out[i] += out[i-1] # Undo the delta encoding.
-  end
-  out
-end
+get_feature(X_binned :: Data, feature_i) = @view X_binned[:, feature_i]
 
 
 abstract type Tree end
@@ -278,40 +246,13 @@ function apply_tree(X_binned :: Data, tree :: Tree) :: Vector{Score}
 end
 
 # Mutates scores.
-function apply_tree!(X_binned :: Array{UInt8,2}, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
+function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   Threads.@threads for i in 1:data_count(X_binned)
   # for i in 1:data_count(X_binned)
     @inbounds begin
       node = tree
       while !isa(node, Leaf)
         if X_binned[i, node.feature_i] <= node.split_i
-          node = node.left
-        else
-          node = node.right
-        end
-      end
-      scores[i] += node.Δscore
-    end
-  end
-
-  scores
-end
-# Mutates scores.
-function apply_tree!(X_binned :: CompressedData, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
-  feature_is = unique(map(node -> node.feature_i, tree_split_nodes(tree)))
-  features_decompressed = Vector{Union{Nothing,AbstractArray}}(nothing, feature_count(X_binned))
-
-  Threads.@threads for feature_i in feature_is
-    features_decompressed[feature_i] = get_feature(X_binned, feature_i)
-  end
-
-  # No threading yet.
-  Threads.@threads for i in 1:data_count(X_binned)
-    @inbounds begin
-      node = tree
-      while !isa(node, Leaf)
-        feature_i = node.feature_i
-        if features_decompressed[feature_i][i] <= node.split_i
           node = node.left
         else
           node = node.right
@@ -399,7 +340,7 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count = 255) :: Vecto
 end
 
 
-function apply_bins(X, bin_splits) :: Array{UInt8,2}
+function apply_bins(X, bin_splits) :: Data
   X_binned = zeros(UInt8, size(X))
 
   Threads.@threads for j in 1:feature_count(X)
@@ -439,67 +380,6 @@ function apply_bins(X, bin_splits) :: Array{UInt8,2}
   end
 
   X_binned
-end
-
-function bin_and_compress(X, bin_splits; prior_data = nothing) :: DataBeingCompressed
-  X_binned = apply_bins(X, bin_splits)
-
-  if prior_data == nothing
-    features_being_compressed =
-      map(1:feature_count(X)) do feature_i
-        buffer             = IOBuffer()
-        compression_stream = CodecZstd.ZstdCompressorStream(buffer)
-        FeatureBeingCompressed(buffer, compression_stream)
-      end
-
-    data_being_compressed = DataBeingCompressed(0, features_being_compressed)
-  else
-    features_being_compressed = prior_data.features_being_compressed
-    data_being_compressed     = prior_data
-  end
-
-  Threads.@threads for feature_i in 1:feature_count(X)
-    # for feature_i in 1:feature_count(X)
-    feature_being_compressed = features_being_compressed[feature_i]
-    last_bin_i               = feature_being_compressed.last_bin_i
-    chunk_to_compress        = Vector{UInt8}(undef, data_count(X))
-    @inbounds for i in 1:data_count(X)
-      chunk_to_compress[i] = X_binned[i, feature_i] - last_bin_i
-      last_bin_i           = X_binned[i, feature_i]
-    end
-    feature_being_compressed.last_bin_i = last_bin_i
-    write(feature_being_compressed.compression_stream, chunk_to_compress)
-    flush(feature_being_compressed.compression_stream)
-  end
-
-  data_being_compressed.data_count += data_count(X)
-
-  data_being_compressed
-end
-
-# If training on compressed features, readout and close the compression streams.
-#
-# This should be done by the client. If we did it automatically, the client's GC will retain the DataBeingCompressed structs. (Which...might not be a problem depending on how the internal buffers work.)
-function finalize_loading(data_being_compressed :: DataBeingCompressed) :: CompressedData
-  compressed_features = map(data_being_compressed.features_being_compressed) do feature_being_compressed
-    write(feature_being_compressed.compression_stream, TranscodingStreams.TOKEN_END)
-    flush(feature_being_compressed.compression_stream)
-    compressed_feature = take!(feature_being_compressed.buffer)[:]
-    close(feature_being_compressed.compression_stream)
-    compressed_feature
-  end
-
-  CompressedData(data_being_compressed.data_count, compressed_features)
-end
-
-function finalize_loading(X_binned :: Data)
-  X_binned
-end
-
-function compression_ratios(compressed_data :: CompressedData)
-  map(compressed_data.compressed_features) do compressed_feature
-    compressed_data.data_count / length(compressed_feature)
-  end
 end
 
 
