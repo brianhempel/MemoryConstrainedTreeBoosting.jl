@@ -267,7 +267,7 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
-function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}, starting_scores = nothing) :: Vector{Score}
+function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}
 
   # thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
   scores = zeros(Score, data_count(X_binned))
@@ -297,7 +297,7 @@ end
 
 # Returns vector of predictions ŷ (post-sigmoid).
 function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
-  scores = apply_trees(X_binned, trees, starting_scores)
+  scores = apply_trees(X_binned, trees; starting_scores = starting_scores)
   if output_raw_scores
     scores
   else
@@ -322,7 +322,7 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count = 255) :: Vecto
 
   Threads.@threads for j in 1:feature_count(X)
   # for j in 1:feature_count(X)
-    sorted_feature_values = sort(X[is, j])
+    sorted_feature_values = sort(@view X[is, j])
 
     splits = zeros(eltype(sorted_feature_values), split_count)
 
