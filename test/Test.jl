@@ -56,3 +56,12 @@ X_binned = apply_bins(X, bin_splits)
 
 println(predict_on_binned(X_binned, trees))
 println(y)
+
+X_transposed = permutedims(X)
+
+(bin_splits, trees) = Transposed.train(X_transposed, y, weights = weights, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
+
+X_transposed_binned = Transposed.apply_bins(X_transposed, bin_splits)
+
+println(Transposed.predict_on_binned(X_transposed_binned, trees))
+println(y)

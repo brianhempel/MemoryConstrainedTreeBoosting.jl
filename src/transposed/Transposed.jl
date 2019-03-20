@@ -1,12 +1,12 @@
-module MemoryConstrainedTreeBoosting
+# Copy of MemoryConstrainedTreeBoosting, but assumes data points are in the columns of the 2D data array (each feature is a row).
 
-export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, Transposed
+module Transposed
+
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load
 
 import Random
 
 import BSON
-
-include("transposed/Transposed.jl")
 
 default_config = (
   weights                 = nothing, # weights for the data
@@ -46,11 +46,11 @@ const BinSplits = Vector{T} where T <: AbstractFloat
 
 const Data = Array{UInt8,2}
 
-data_count(X :: Array{<:Number,2}) = size(X,1)
+data_count(X :: Array{<:Number,2}) = size(X,2)
 
-feature_count(X :: Array{<:Number,2}) = size(X,2)
+feature_count(X :: Array{<:Number,2}) = size(X,1)
 
-get_feature(X_binned :: Data, feature_i) = @view X_binned[:, feature_i]
+get_feature(X_binned :: Data, feature_i) = @view X_binned[feature_i, :]
 
 
 abstract type Tree end
@@ -68,7 +68,16 @@ mutable struct Histogram
   Σ∇∇losses    :: Vector{Loss}
   data_weights :: Vector{DataWeight}
 
+  Histogram()          = new([], [], [])
   Histogram(bin_count) = new(zeros(Loss, bin_count), zeros(Loss, bin_count), zeros(DataWeight, bin_count))
+end
+
+function add_histograms(histogram1 :: Histogram, histogram2 :: Histogram)
+  result = Histogram()
+  result.Σ∇losses     = histogram1.Σ∇losses     + histogram2.Σ∇losses
+  result.Σ∇∇losses    = histogram1.Σ∇∇losses    + histogram2.Σ∇∇losses
+  result.data_weights = histogram1.data_weights + histogram2.data_weights
+  result
 end
 
 mutable struct Node <: Tree
@@ -253,7 +262,7 @@ function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) ::
     @inbounds begin
       node = tree
       while !isa(node, Leaf)
-        if X_binned[i, node.feature_i] <= node.split_i
+        if X_binned[node.feature_i, i] <= node.split_i
           node = node.left
         else
           node = node.right
@@ -323,7 +332,7 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count = 255) :: Vecto
 
   Threads.@threads for j in 1:feature_count(X)
   # for j in 1:feature_count(X)
-    sorted_feature_values = sort(@view X[is, j])
+    sorted_feature_values = sort(@view X[j, is])
 
     splits = zeros(eltype(sorted_feature_values), split_count)
 
@@ -344,12 +353,13 @@ end
 function apply_bins(X, bin_splits) :: Data
   X_binned = zeros(UInt8, size(X))
 
-  Threads.@threads for j in 1:feature_count(X)
+  Threads.@threads for i in 1:data_count(X)
   # for j in 1:feature_count(X)
-    splits_for_feature = bin_splits[j]
-    bin_count = length(splits_for_feature) + 1
-    @inbounds for i in 1:data_count(X)
-      value   = X[i,j]
+    @inbounds for j in 1:feature_count(X)
+      splits_for_feature = bin_splits[j]
+      bin_count = length(splits_for_feature) + 1
+
+      value   = X[j,i]
 
       jump_step = div(bin_count - 1, 2)
       split_i   = 1
@@ -376,9 +386,45 @@ function apply_bins(X, bin_splits) :: Data
       # split_i = findfirst(split_value -> split_value > value, @view splits_for_feature[split_i:length(splits_for_feature)])
       # bin_i   = split_i == nothing ? bin_count : split_i
 
-      X_binned[i,j] = UInt8(bin_i) # Store as 1-255 to match Julia indexing. We leave 0 unused but saves us from having to remember to convert.
+      X_binned[j,i] = UInt8(bin_i) # Store as 1-255 to match Julia indexing. We leave 0 unused but saves us from having to remember to convert.
     end
   end
+
+  # Threads.@threads for j in 1:feature_count(X)
+  # # for j in 1:feature_count(X)
+  #   splits_for_feature = bin_splits[j]
+  #   bin_count = length(splits_for_feature) + 1
+  #   @inbounds for i in 1:data_count(X)
+  #     value   = X[i,j]
+  #
+  #     jump_step = div(bin_count - 1, 2)
+  #     split_i   = 1
+  #
+  #     # Binary-ish jumping
+  #
+  #     # invariant: split_i > 1 implies split_i split <= value
+  #     while jump_step > 0
+  #       while jump_step > 0 && splits_for_feature[split_i + jump_step] > value
+  #         jump_step = div(jump_step, 2)
+  #       end
+  #       split_i += jump_step
+  #       jump_step = div(jump_step, 2)
+  #     end
+  #
+  #     bin_i = bin_count
+  #     for k in split_i:length(splits_for_feature)
+  #       if splits_for_feature[k] > value
+  #         bin_i = k
+  #         break
+  #       end
+  #     end
+  #
+  #     # split_i = findfirst(split_value -> split_value > value, @view splits_for_feature[split_i:length(splits_for_feature)])
+  #     # bin_i   = split_i == nothing ? bin_count : split_i
+  #
+  #     X_binned[i,j] = UInt8(bin_i) # Store as 1-255 to match Julia indexing. We leave 0 unused but saves us from having to remember to convert.
+  #   end
+  # end
 
   X_binned
 end
@@ -509,7 +555,6 @@ function build_one_tree(X_binned :: Data, y, ŷ, weights, split_expected_Δloss_
 
   features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
 
-  # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
   feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
 
   tree_changed = true
@@ -579,14 +624,20 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, 
       # Find best feature and best split
       # Expected Δlogloss at leaf = -0.5 * (Σ ∇loss)² / (Σ ∇∇loss)
 
-      if isempty(leaf.features_histograms)
-        leaf.features_histograms = map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
-      end
+      # if isempty(leaf.features_histograms)
+      #   leaf.features_histograms = map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
+      # end
 
-      Threads.@threads for feature_i in feature_is
-      # for feature_i in feature_is
-        calculate_feature_histogram!(X_binned, y, ŷ, weights, feature_i, tree, leaf)
-      end
+      # thread_features_histograms = map(1:Threads.nthreads()) do _
+      #   map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
+      # end
+
+      # Threads.@threads for feature_i in feature_is
+      # # for feature_i in feature_is
+      #   calculate_feature_histogram!(X_binned, y, ŷ, weights, feature_i, tree, leaf)
+      # end
+
+      calculate_leaf_histograms!(X_binned, y, ŷ, weights, feature_is, tree, leaf)
 
       leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, split_expected_Δloss_noise_std_dev)
     end # if leaf.maybe_split_candidate == nothing
@@ -637,101 +688,209 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, 
   end
 end
 
-# Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
-#
-# Its own method because it's faster that way.
-function build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
-  @inbounds for ii in 1:3:(length(leaf_is)-2)
-    i1 = leaf_is[ii]
-    i2 = leaf_is[ii+1]
-    i3 = leaf_is[ii+2]
-    # i4 = leaf.is[ii+3]
-  # for i in leaf.is # this version is almost twice as slow. Doesn't make sense.
-    bin_i1 = feature_binned[i1]
-    bin_i2 = feature_binned[i2]
-    bin_i3 = feature_binned[i3]
-    # bin_i4 = feature_binned[i4]
+function thread_stuff(X_binned, leaf_is, thread_features_histograms, weights, y, ŷ, feature_is_chunk)
+  Threads.@threads for ii in 1:length(leaf_is)
+    i = leaf_is[ii]
 
-    data_point_weight1 = weights[i1]
-    data_point_weight2 = weights[i2]
-    data_point_weight3 = weights[i3]
-    # data_point_weight4 = weights[i4]
+    features_histograms = thread_features_histograms[Threads.threadid()]
 
-    ∇loss1  = ∇logloss(y[i1], ŷ[i1]) * data_point_weight1
-    ∇loss2  = ∇logloss(y[i2], ŷ[i2]) * data_point_weight2
-    ∇loss3  = ∇logloss(y[i3], ŷ[i3]) * data_point_weight3
-    # ∇loss4  = ∇logloss(y[i4], ŷ[i4]) * data_point_weight4
-    ∇∇loss1 = ∇∇logloss(ŷ[i1])       * data_point_weight1
-    ∇∇loss2 = ∇∇logloss(ŷ[i2])       * data_point_weight2
-    ∇∇loss3 = ∇∇logloss(ŷ[i3])       * data_point_weight3
-    # ∇∇loss4 = ∇∇logloss(ŷ[i4])       * data_point_weight4
+    data_point_weight = weights[i]
+    ∇loss             = ∇logloss(y[i], ŷ[i]) * data_point_weight
+    ∇∇loss            = ∇∇logloss(ŷ[i])      * data_point_weight
 
-    Σ∇losses[bin_i1]     += ∇loss1
-    Σ∇losses[bin_i2]     += ∇loss2
-    Σ∇losses[bin_i3]     += ∇loss3
-    # Σ∇losses[bin_i4]     += ∇loss4
-    Σ∇∇losses[bin_i1]    += ∇∇loss1
-    Σ∇∇losses[bin_i2]    += ∇∇loss2
-    Σ∇∇losses[bin_i3]    += ∇∇loss3
-    # Σ∇∇losses[bin_i4]    += ∇∇loss4
-    data_weights[bin_i1] += data_point_weight1
-    data_weights[bin_i2] += data_point_weight2
-    data_weights[bin_i3] += data_point_weight3
-    # data_weights[bin_i4] += data_point_weight4
+    @inbounds for feature_ii in 1:length(feature_is_chunk)
+      feature_i = feature_is_chunk[feature_ii]
+      histogram = features_histograms[feature_i]
+
+      bin_i = X_binned[feature_i, i]
+
+      histogram.Σ∇losses[bin_i]     += ∇loss
+      histogram.Σ∇∇losses[bin_i]    += ∇∇loss
+      histogram.data_weights[bin_i] += data_point_weight
+    end
   end
-
-  ()
 end
 
-# Calculates and sets leaf.features_histograms[feature_i]
-function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf)
+# Computes and sets leaf.features_histograms
+function calculate_leaf_histograms!(X_binned :: Data, y, ŷ, weights, feature_is, tree, leaf)
 
   max_bins = Int64(typemax(UInt8))
 
-  histogram = leaf.features_histograms[feature_i]
 
-  # If the parent cached its histogram, and the other sibling has already done its calculation, then we can calculate our histogram by simple subtraction.
+  # If the parent cached its histograms, and the other sibling has already done its calculation, then we can calculate our histograms by simple subtraction.
   parent = parent_node(tree, leaf)
   if parent != nothing
     sibling = (parent.left === leaf ? parent.right : parent.left)
   end
 
   if parent != nothing && !isempty(parent.features_histograms) && !isempty(sibling.features_histograms)
-    # Expediated histogram calculation.
-    parent_histogram  = parent.features_histograms[feature_i]
-    sibling_histogram = sibling.features_histograms[feature_i]
+    # Expediated histograms calculation.
+    leaf.features_histograms = map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
 
-    histogram.Σ∇losses     .= parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses
-    histogram.Σ∇∇losses    .= parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses
-    histogram.data_weights .= parent_histogram.data_weights .- sibling_histogram.data_weights
+    for feature_i in feature_is
+      histogram = leaf.features_histograms[feature_i]
+
+      parent_histogram  = parent.features_histograms[feature_i]
+      sibling_histogram = sibling.features_histograms[feature_i]
+
+      histogram.Σ∇losses     .= parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses
+      histogram.Σ∇∇losses    .= parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses
+      histogram.data_weights .= parent_histogram.data_weights .- sibling_histogram.data_weights
+    end
   else
     # Can't expediate hist_bin calculation.
-    feature_binned = get_feature(X_binned, feature_i)
 
-    Σ∇losses     = histogram.Σ∇losses
-    Σ∇∇losses    = histogram.Σ∇∇losses
-    data_weights = histogram.data_weights
+    # leaf.features_histograms = map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
+    #
+    # features_histograms = leaf.features_histograms
+    #
+    # leaf_is = leaf.is
+    #
+    # feature_is_chunk_size = 20
+    # feature_is_chunks = collect(Iterators.partition(feature_is, feature_is_chunk_size))
+    #
+    # for feature_is_chunk in feature_is_chunks
+    #   println(feature_is_chunk)
+    #   for ii in 1:length(leaf_is)
+    #     i = leaf_is[ii]
+    #
+    #     # features_histograms = thread_features_histograms[Threads.threadid()]
+    #
+    #     data_point_weight = weights[i]
+    #     ∇loss             = ∇logloss(y[i], ŷ[i]) * data_point_weight
+    #     ∇∇loss            = ∇∇logloss(ŷ[i])      * data_point_weight
+    #
+    #     @inbounds for feature_ii in 1:length(feature_is_chunk)
+    #       feature_i = feature_is_chunk[feature_ii]
+    #       histogram = features_histograms[feature_i]
+    #
+    #       bin_i = X_binned[feature_i, i]
+    #
+    #       histogram.Σ∇losses[bin_i]     += ∇loss
+    #       histogram.Σ∇∇losses[bin_i]    += ∇∇loss
+    #       histogram.data_weights[bin_i] += data_point_weight
+    #     end
+    #   end
+    # end
 
-    build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf.is, Σ∇losses, Σ∇∇losses, data_weights)
-
-    # The last couple points...
-    @inbounds for ii in ((1:3:(length(leaf.is)-2)).stop + 3):length(leaf.is)
-      i = leaf.is[ii]
-      bin_i = feature_binned[i]
-
-      data_point_weight = weights[i]
-
-      ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
-      ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
-
-      Σ∇losses[bin_i]     += ∇loss
-      Σ∇∇losses[bin_i]    += ∇∇loss
-      data_weights[bin_i] += data_point_weight
+    thread_features_histograms = map(1:Threads.nthreads()) do _
+      map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
     end
+
+    # feature_binned = get_feature(X_binned, feature_i)
+
+    # Σ∇losses     = histogram.Σ∇losses
+    # Σ∇∇losses    = histogram.Σ∇∇losses
+    # data_weights = histogram.data_weights
+
+    leaf_is = leaf.is
+
+    feature_is_chunk_size = 200
+    feature_is_chunks = collect(Iterators.partition(feature_is, feature_is_chunk_size))
+
+    for feature_is_chunk in feature_is_chunks
+      # println(feature_is_chunk)
+      thread_stuff(X_binned, leaf_is, thread_features_histograms, weights, y, ŷ, feature_is_chunk)
+    end
+
+    # print("summing...")
+    leaf.features_histograms = map(1:feature_count(X_binned)) do feature_i
+      thread_histograms = map(1:Threads.nthreads()) do thread_i
+        thread_features_histograms[thread_i][feature_i]
+      end
+      reduce(add_histograms, thread_histograms)
+    end
+    # println("done")
   end
 
   ()
 end
+# function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf)
+#
+#   max_bins = Int64(typemax(UInt8))
+#
+#   histogram = leaf.features_histograms[feature_i]
+#
+#   # If the parent cached its histogram, and the other sibling has already done its calculation, then we can calculate our histogram by simple subtraction.
+#   parent = parent_node(tree, leaf)
+#   if parent != nothing
+#     sibling = (parent.left === leaf ? parent.right : parent.left)
+#   end
+#
+#   if parent != nothing && !isempty(parent.features_histograms) && !isempty(sibling.features_histograms)
+#     # Expediated histogram calculation.
+#     parent_histogram  = parent.features_histograms[feature_i]
+#     sibling_histogram = sibling.features_histograms[feature_i]
+#
+#     histogram.Σ∇losses     .= parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses
+#     histogram.Σ∇∇losses    .= parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses
+#     histogram.data_weights .= parent_histogram.data_weights .- sibling_histogram.data_weights
+#   else
+#     # Can't expediate hist_bin calculation.
+#     feature_binned = get_feature(X_binned, feature_i)
+#
+#     Σ∇losses     = histogram.Σ∇losses
+#     Σ∇∇losses    = histogram.Σ∇∇losses
+#     data_weights = histogram.data_weights
+#
+#     leaf_is = leaf.is
+#
+#     @inbounds for ii in 1:3:(length(leaf.is)-2)
+#       i1 = leaf_is[ii]
+#       i2 = leaf_is[ii+1]
+#       i3 = leaf_is[ii+2]
+#       # i4 = leaf.is[ii+3]
+#     # for i in leaf.is # this version is almost twice as slow. Doesn't make sense.
+#       bin_i1 = feature_binned[i1]
+#       bin_i2 = feature_binned[i2]
+#       bin_i3 = feature_binned[i3]
+#       # bin_i4 = feature_binned[i4]
+#
+#       data_point_weight1 = weights[i1]
+#       data_point_weight2 = weights[i2]
+#       data_point_weight3 = weights[i3]
+#       # data_point_weight4 = weights[i4]
+#
+#       ∇loss1  = ∇logloss(y[i1], ŷ[i1]) * data_point_weight1
+#       ∇loss2  = ∇logloss(y[i2], ŷ[i2]) * data_point_weight2
+#       ∇loss3  = ∇logloss(y[i3], ŷ[i3]) * data_point_weight3
+#       # ∇loss4  = ∇logloss(y[i4], ŷ[i4]) * data_point_weight4
+#       ∇∇loss1 = ∇∇logloss(ŷ[i1])       * data_point_weight1
+#       ∇∇loss2 = ∇∇logloss(ŷ[i2])       * data_point_weight2
+#       ∇∇loss3 = ∇∇logloss(ŷ[i3])       * data_point_weight3
+#       # ∇∇loss4 = ∇∇logloss(ŷ[i4])       * data_point_weight4
+#
+#       Σ∇losses[bin_i1]     += ∇loss1
+#       Σ∇losses[bin_i2]     += ∇loss2
+#       Σ∇losses[bin_i3]     += ∇loss3
+#       # Σ∇losses[bin_i4]     += ∇loss4
+#       Σ∇∇losses[bin_i1]    += ∇∇loss1
+#       Σ∇∇losses[bin_i2]    += ∇∇loss2
+#       Σ∇∇losses[bin_i3]    += ∇∇loss3
+#       # Σ∇∇losses[bin_i4]    += ∇∇loss4
+#       data_weights[bin_i1] += data_point_weight1
+#       data_weights[bin_i2] += data_point_weight2
+#       data_weights[bin_i3] += data_point_weight3
+#       # data_weights[bin_i4] += data_point_weight4
+#     end
+#
+#     @inbounds for ii in ((1:3:(length(leaf.is)-2)).stop + 3):length(leaf.is)
+#       i = leaf_is[ii]
+#       bin_i = feature_binned[i]
+#
+#       data_point_weight = weights[i]
+#
+#       ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
+#       ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
+#
+#       Σ∇losses[bin_i]     += ∇loss
+#       Σ∇∇losses[bin_i]    += ∇∇loss
+#       data_weights[bin_i] += data_point_weight
+#     end
+#   end
+#
+#   ()
+# end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, split_expected_Δloss_noise_std_dev)
@@ -794,4 +953,4 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
   SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 end
 
-end # module MemoryConstrainedTreeBoosting
+end # module Transposed
