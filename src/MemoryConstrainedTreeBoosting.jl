@@ -636,6 +636,52 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, 
   end
 end
 
+# Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
+#
+# Its own method because it's faster that way.
+function build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+  @inbounds for ii in 1:3:(length(leaf_is)-2)
+    i1 = leaf_is[ii]
+    i2 = leaf_is[ii+1]
+    i3 = leaf_is[ii+2]
+    # i4 = leaf.is[ii+3]
+  # for i in leaf.is # this version is almost twice as slow. Doesn't make sense.
+    bin_i1 = feature_binned[i1]
+    bin_i2 = feature_binned[i2]
+    bin_i3 = feature_binned[i3]
+    # bin_i4 = feature_binned[i4]
+
+    data_point_weight1 = weights[i1]
+    data_point_weight2 = weights[i2]
+    data_point_weight3 = weights[i3]
+    # data_point_weight4 = weights[i4]
+
+    ∇loss1  = ∇logloss(y[i1], ŷ[i1]) * data_point_weight1
+    ∇loss2  = ∇logloss(y[i2], ŷ[i2]) * data_point_weight2
+    ∇loss3  = ∇logloss(y[i3], ŷ[i3]) * data_point_weight3
+    # ∇loss4  = ∇logloss(y[i4], ŷ[i4]) * data_point_weight4
+    ∇∇loss1 = ∇∇logloss(ŷ[i1])       * data_point_weight1
+    ∇∇loss2 = ∇∇logloss(ŷ[i2])       * data_point_weight2
+    ∇∇loss3 = ∇∇logloss(ŷ[i3])       * data_point_weight3
+    # ∇∇loss4 = ∇∇logloss(ŷ[i4])       * data_point_weight4
+
+    Σ∇losses[bin_i1]     += ∇loss1
+    Σ∇losses[bin_i2]     += ∇loss2
+    Σ∇losses[bin_i3]     += ∇loss3
+    # Σ∇losses[bin_i4]     += ∇loss4
+    Σ∇∇losses[bin_i1]    += ∇∇loss1
+    Σ∇∇losses[bin_i2]    += ∇∇loss2
+    Σ∇∇losses[bin_i3]    += ∇∇loss3
+    # Σ∇∇losses[bin_i4]    += ∇∇loss4
+    data_weights[bin_i1] += data_point_weight1
+    data_weights[bin_i2] += data_point_weight2
+    data_weights[bin_i3] += data_point_weight3
+    # data_weights[bin_i4] += data_point_weight4
+  end
+
+  ()
+end
+
 # Calculates and sets leaf.features_histograms[feature_i]
 function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf)
 
@@ -665,49 +711,11 @@ function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_
     Σ∇∇losses    = histogram.Σ∇∇losses
     data_weights = histogram.data_weights
 
-    leaf_is = leaf.is
+    build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf.is, Σ∇losses, Σ∇∇losses, data_weights)
 
-    @inbounds for ii in 1:3:(length(leaf.is)-2)
-      i1 = leaf_is[ii]
-      i2 = leaf_is[ii+1]
-      i3 = leaf_is[ii+2]
-      # i4 = leaf.is[ii+3]
-    # for i in leaf.is # this version is almost twice as slow. Doesn't make sense.
-      bin_i1 = feature_binned[i1]
-      bin_i2 = feature_binned[i2]
-      bin_i3 = feature_binned[i3]
-      # bin_i4 = feature_binned[i4]
-
-      data_point_weight1 = weights[i1]
-      data_point_weight2 = weights[i2]
-      data_point_weight3 = weights[i3]
-      # data_point_weight4 = weights[i4]
-
-      ∇loss1  = ∇logloss(y[i1], ŷ[i1]) * data_point_weight1
-      ∇loss2  = ∇logloss(y[i2], ŷ[i2]) * data_point_weight2
-      ∇loss3  = ∇logloss(y[i3], ŷ[i3]) * data_point_weight3
-      # ∇loss4  = ∇logloss(y[i4], ŷ[i4]) * data_point_weight4
-      ∇∇loss1 = ∇∇logloss(ŷ[i1])       * data_point_weight1
-      ∇∇loss2 = ∇∇logloss(ŷ[i2])       * data_point_weight2
-      ∇∇loss3 = ∇∇logloss(ŷ[i3])       * data_point_weight3
-      # ∇∇loss4 = ∇∇logloss(ŷ[i4])       * data_point_weight4
-
-      Σ∇losses[bin_i1]     += ∇loss1
-      Σ∇losses[bin_i2]     += ∇loss2
-      Σ∇losses[bin_i3]     += ∇loss3
-      # Σ∇losses[bin_i4]     += ∇loss4
-      Σ∇∇losses[bin_i1]    += ∇∇loss1
-      Σ∇∇losses[bin_i2]    += ∇∇loss2
-      Σ∇∇losses[bin_i3]    += ∇∇loss3
-      # Σ∇∇losses[bin_i4]    += ∇∇loss4
-      data_weights[bin_i1] += data_point_weight1
-      data_weights[bin_i2] += data_point_weight2
-      data_weights[bin_i3] += data_point_weight3
-      # data_weights[bin_i4] += data_point_weight4
-    end
-
+    # The last couple points...
     @inbounds for ii in ((1:3:(length(leaf.is)-2)).stop + 3):length(leaf.is)
-      i = leaf_is[ii]
+      i = leaf.is[ii]
       bin_i = feature_binned[i]
 
       data_point_weight = weights[i]
