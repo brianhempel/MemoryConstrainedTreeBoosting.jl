@@ -1,12 +1,11 @@
 module MemoryConstrainedTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, Transposed
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load
 
 import Random
 
 import BSON
 
-include("transposed/Transposed.jl")
 
 default_config = (
   weights                 = nothing, # weights for the data
