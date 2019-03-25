@@ -87,18 +87,56 @@ mutable struct Leaf <: Tree
   Leaf(Δscore, is = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, maybe_split_candidate, features_histograms)
 end
 
+function tree_to_dict(node :: Node) :: Dict{Symbol,Any}
+  Dict(
+    :type      => "Node",
+    :feature_i => node.feature_i,
+    :split_i   => node.split_i,
+    :left      => tree_to_dict(node.left),
+    :right     => tree_to_dict(node.right)
+  )
+end
+
+function tree_to_dict(leaf :: Leaf) :: Dict{Symbol,Any}
+  Dict(
+    :type        => "Leaf",
+    :delta_score => leaf.Δscore
+  )
+end
+
+function dict_to_tree(dict :: Dict{Symbol,Any}) :: Tree
+  if dict[:type] == "Node"
+    Node(dict[:feature_i], dict[:split_i], dict_to_tree(dict[:left]), dict_to_tree(dict[:right]), [])
+  elseif dict[:type] == "Leaf"
+    Leaf(dict[:delta_score])
+  else
+    error("Bad tree type $(dict[:type])!")
+  end
+end
 
 # Returns path
+# Simple use of BSON.@save sometimes croaks on load with "UndefVarError: MemoryConstrainedTreeBoosting not defined"
+# So we avoid our custom Tree things
 function save(path, bin_splits, trees)
   trees = map(strip_tree_training_info, trees)
-  BSON.@save path bin_splits trees
+
+  # BSON.@save path bin_splits trees
+  # Default serialization is fine for bin_splits.
+  BSON.bson(path, bin_splits = bin_splits, trees = map(tree_to_dict, trees))
+
   path
 end
 
 
 # Returns (bin_splits, trees)
+# Simple use of BSON.@load sometimes croaks with "UndefVarError: MemoryConstrainedTreeBoosting not defined"
 function load(path)
-  BSON.@load path bin_splits trees
+  # BSON.@load path bin_splits trees
+  # println(BSON.parse(path))
+  dict       = BSON.load(path)
+  bin_splits = dict[:bin_splits] # Default deserialization is fine for bin_splits.
+  trees      = map(dict_to_tree, dict[:trees])
+
   FeatureType = typeof(bin_splits[1][1])
   (Vector{BinSplits{FeatureType}}(bin_splits), Vector{Tree}(trees))
 end
