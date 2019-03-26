@@ -512,14 +512,23 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
 end
 
 function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
-  scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
-
-  trees = copy(prior_trees)
-
   weights = get_config_field(config, :weights)
   if weights == nothing
     weights = fill(DataWeight(1.0), length(y))
   end
+
+  if isempty(prior_trees)
+    initial_score = begin
+      probability = sum(y .* weights) / sum(weights)
+      log(probability / (1-probability)) # inverse sigmoid
+    end
+
+    prior_trees = Tree[Leaf(initial_score)]
+  end
+
+  scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
+
+  trees = copy(prior_trees)
 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
