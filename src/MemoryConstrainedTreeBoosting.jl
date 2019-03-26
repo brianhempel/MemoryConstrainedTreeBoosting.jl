@@ -1,6 +1,6 @@
 module MemoryConstrainedTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, make_callback_to_track_validation_loss
 
 import Random
 
@@ -8,20 +8,24 @@ import BSON
 
 
 default_config = (
-  weights                 = nothing, # weights for the data
-  bin_count               = 255,
-  iteration_count         = 10,
-  min_data_weight_in_leaf = 10.0,
-  l2_regularization       = 1.0,
-  max_leaves              = 32,
-  max_depth               = 6,
-  max_delta_score         = 1.0e10, # Before shrinkage.
-  learning_rate           = 0.1,
-  feature_fraction        = 1.0, # Per tree.
-  bagging_temperature     = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
-  random_strength         = 0.0, # Inspired by Catboost. Relative standard deviation of noise added to the expected loss improvement of each split. Affects split randomization. Decays throughout training. If using, start with a value of 0.01 - 0.2.
-  feature_i_to_name       = nothing,
-  iteration_callback      = trees -> (),
+  weights                            = nothing, # weights for the data
+  bin_count                          = 255,
+  iteration_count                    = 10,
+  min_data_weight_in_leaf            = 10.0,
+  l2_regularization                  = 1.0,
+  max_leaves                         = 32,
+  max_depth                          = 6,
+  max_delta_score                    = 1.0e10, # Before shrinkage.
+  learning_rate                      = 0.1,
+  feature_fraction                   = 1.0, # Per tree.
+  bagging_temperature                = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
+  random_strength                    = 0.0, # Inspired by Catboost. Relative standard deviation of noise added to the expected loss improvement of each split. Affects split randomization. Decays throughout training. If using, start with a value of 0.01 - 0.2.
+  feature_i_to_name                  = nothing,
+  iteration_callback                 = nothing, # Callback is given trees. If you want to override the default early stopping validation callback.
+  validation_X                       = nothing,
+  validation_y                       = nothing,
+  validation_weights                 = nothing,
+  max_iterations_without_improvement = typemax(Int64)
 )
 
 
@@ -420,6 +424,49 @@ function apply_bins(X, bin_splits) :: Data
   X_binned
 end
 
+struct EarlyStop <: Exception
+end
+
+function make_callback_to_track_validation_loss(validation_X_binned, validation_y; validation_weights = nothing, max_iterations_without_improvement = typemax(Int64))
+  validation_scores              = nothing
+  best_loss                      = Loss(Inf)
+  iterations_without_improvement = 0
+
+  # Returns validation_loss in case you want to call this from your own callback.
+  #
+  # On early stop, mutates trees to remove the last few unhelpful trees.
+  iteration_callback(trees) = begin
+    new_tree = last(trees)
+
+    if isnothing(validation_scores)
+      validation_scores = predict_on_binned(validation_X_binned, trees, output_raw_scores = true)
+    else
+      validation_scores = predict_on_binned(validation_X_binned, [new_tree], starting_scores = validation_scores, output_raw_scores = true)
+    end
+    validation_ŷ = σ.(validation_scores)
+    if isnothing(validation_weights)
+      validation_loss = sum(logloss.(validation_y, validation_ŷ)) / length(validation_y)
+    else
+      validation_loss = sum(logloss.(validation_y, validation_ŷ) .* validation_weights) / sum(validation_weights)
+    end
+
+    if validation_loss < best_loss
+      best_loss                      = validation_loss
+      iterations_without_improvement = 0
+      print("\rValidation loss: $validation_loss    ")
+    else
+      iterations_without_improvement += 1
+      if iterations_without_improvement >= max_iterations_without_improvement
+        resize!(trees, length(trees) - max_iterations_without_improvement)
+        throw(EarlyStop())
+      end
+    end
+
+    validation_loss
+  end
+
+  iteration_callback
+end
 
 # Trains for iteration_count rounds and returns (bin_splits, prior_and_new_trees).
 function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
@@ -435,7 +482,31 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
   println("done.")
   # println(X_binned)
 
-  trees = train_on_binned(X_binned, y; prior_trees = prior_trees, config...)
+  iteration_callback =
+    if !isnothing(get_config_field(config, :validation_X)) && !isnothing(get_config_field(config, :validation_y))
+      if isnothing(get_config_field(config, :iteration_callback))
+        print("Binning validation data...")
+        validation_X_binned = apply_bins(get_config_field(config, :validation_X), bin_splits)
+        println("done.")
+
+        make_callback_to_track_validation_loss(
+            validation_X_binned,
+            get_config_field(config, :validation_y);
+            validation_weights = get_config_field(config, :validation_weights),
+            max_iterations_without_improvement = get_config_field(config, :max_iterations_without_improvement)
+          )
+      else
+        println("Warning: both validation_X and iteration_callback provided. validation_X ignored.")
+        get_config_field(config, :iteration_callback)
+      end
+    elseif !isnothing(get_config_field(config, :validation_X)) || !isnothing(get_config_field(config, :validation_y))
+      println("Warning: Must provide both validation_X and validation_y!")
+      get_config_field(config, :iteration_callback)
+    else
+      get_config_field(config, :iteration_callback)
+    end
+
+  trees = train_on_binned(X_binned, y; prior_trees = prior_trees, config..., iteration_callback = iteration_callback)
 
   (bin_splits, trees)
 end
@@ -450,22 +521,32 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
     weights = fill(DataWeight(1.0), length(y))
   end
 
-  for iteration_i in 1:get_config_field(config, :iteration_count)
-    # @time begin
-    begin
-      (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
+  try
+    for iteration_i in 1:get_config_field(config, :iteration_count)
+      # @time begin
+      begin
+        (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
 
-      ŷ = σ.(scores)
-      iteration_loss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
-      # println(ŷ)
-      # println("Iteration $iteration_i training loss: $iteration_loss")
+        ŷ = σ.(scores)
+        iteration_loss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
+        # println(ŷ)
+        # println("Iteration $iteration_i training loss: $iteration_loss")
 
-      # print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
-      # println()
+        # print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
+        # println()
 
-      push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, should save memory if we strip off the list of indices
+        push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, should save memory if we strip off the list of indices
 
-      get_config_field(config, :iteration_callback)(trees)
+        if !isnothing(get_config_field(config, :iteration_callback))
+          get_config_field(config, :iteration_callback)(trees)
+        end
+      end
+    end
+  catch expection
+    println()
+    if isa(expection, EarlyStop)
+    else
+      rethrow()
     end
   end
 

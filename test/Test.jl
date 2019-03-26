@@ -36,9 +36,24 @@ weights = Float32[10.0
                   10.0
                   1.0]
 
+validation_X       = X[1:3, :]
+validation_y       = y[1:3]
+validation_weights = weights[1:3]
+
 # weights = weights ./ weights
 
-(bin_splits, trees) = train(X, y, weights = weights, bin_count = 4, iteration_count = 20, min_data_weight_in_leaf = 2.0, learning_rate = 0.3)
+(bin_splits, trees) =
+  train(
+      X, y,
+      weights = weights,
+      bin_count = 4,
+      iteration_count = 20,
+      min_data_weight_in_leaf = 2.0,
+      learning_rate = 0.3,
+      validation_X       = validation_X,
+      validation_y       = validation_y,
+      validation_weights = validation_weights
+    )
 
 bin_splits :: Vector{MemoryConstrainedTreeBoosting.BinSplits{Float32}}
 
