@@ -19,7 +19,6 @@ default_config = (
   learning_rate                      = 0.1,
   feature_fraction                   = 1.0, # Per tree.
   bagging_temperature                = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
-  random_strength                    = 0.0, # Inspired by Catboost. Relative standard deviation of noise added to the expected loss improvement of each split. Affects split randomization. Decays throughout training. If using, start with a value of 0.01 - 0.2.
   feature_i_to_name                  = nothing,
   iteration_callback                 = nothing, # Callback is given trees. If you want to override the default early stopping validation callback.
   validation_X                       = nothing,
@@ -570,7 +569,6 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
 
   learning_rate       = Score(get_config_field(config, :learning_rate))
   bagging_temperature = DataWeight(get_config_field(config, :bagging_temperature))
-  random_strength     = Loss(get_config_field(config, :random_strength))
 
   weights =
     # Adapted from Catboost
@@ -587,43 +585,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
       weights
     end
 
-  split_expected_Δloss_noise_std_dev = begin
-    if random_strength == 0.0f0
-      0.0f0
-    else
-      l2_regularization = Loss(get_config_field(config, :l2_regularization))
-      max_delta_score   = Score(get_config_field(config, :max_delta_score))
-
-      # Not how Catboost does it, but this seems the most reasonable baseline given how we calculate improvements.
-
-      Δloss_if_each_datapoint_got_its_own_leaf = 0.0f0
-      @inbounds for i in 1:data_count(X_binned)
-        ∇loss  = ∇logloss(y[i], ŷ[i]) * weights[i]
-        ∇∇loss = ∇∇logloss(ŷ[i])      * weights[i]
-
-        Δloss_if_each_datapoint_got_its_own_leaf += leaf_expected_Δloss(∇loss, ∇∇loss, l2_regularization / data_count(X_binned), max_delta_score)
-      end
-
-      # # This decay schedule is from Catboost, https://github.com/catboost/catboost/blob/master/catboost/cuda/methods/random_score_helper.h#L18-L22
-      # decay_multiplier = begin
-      #   model_size     = prior_tree_count * learning_rate
-      #   log_data_count = log(data_count(X_binned))
-      #   model_left     = exp(log_data_count - model_size)
-      #
-      #   model_left / (1.0 + model_left)
-      # end
-
-      # Catboost's decay schedule doesn't make sense. We start overfitting at a model size of 5-10, not at a model size of log(sample_count).
-      decay_multiplier = begin
-        model_size = prior_tree_count * learning_rate
-        0.01f0^(model_size / 5.0f0)
-      end
-
-      Δloss_if_each_datapoint_got_its_own_leaf * decay_multiplier * random_strength
-    end
-  end
-
-  tree = build_one_tree(X_binned, y, ŷ, weights, split_expected_Δloss_noise_std_dev; config...)
+  tree = build_one_tree(X_binned, y, ŷ, weights; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   new_scores = copy(scores)
   apply_tree!(X_binned, tree, new_scores)
@@ -631,7 +593,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
 end
 
 
-function build_one_tree(X_binned :: Data, y, ŷ, weights, split_expected_Δloss_noise_std_dev; config...) # y = labels, ŷ = predictions so far
+function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
   tree = Leaf(optimal_Δscore(y, ŷ, weights, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))), collect(1:length(y)), nothing, [])
 
   features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
@@ -645,7 +607,7 @@ function build_one_tree(X_binned :: Data, y, ŷ, weights, split_expected_Δloss_
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, weights, feature_is, split_expected_Δloss_noise_std_dev; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, weights, feature_is; config...)
   end
 
   tree
@@ -685,7 +647,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, split_expected_Δloss_noise_std_dev; config...)
+function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; config...)
   leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
 
   max_bins = Int64(typemax(UInt8))
@@ -715,7 +677,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is, 
         calculate_feature_histogram!(X_binned, y, ŷ, weights, feature_i, tree, leaf)
       end
 
-      leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, split_expected_Δloss_noise_std_dev)
+      leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
     end # if leaf.maybe_split_candidate == nothing
   end # for leaf in leaves
 
@@ -861,7 +823,7 @@ function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_
 end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
-function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score, split_expected_Δloss_noise_std_dev)
+function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
   # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
   max_bins = Int64(typemax(UInt8))
 
@@ -907,8 +869,6 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
         -this_leaf_expected_Δloss +
         leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
         leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
-
-      expected_Δloss += randn(Loss) * split_expected_Δloss_noise_std_dev
 
       if expected_Δloss < best_expected_Δloss
         best_expected_Δloss = expected_Δloss
