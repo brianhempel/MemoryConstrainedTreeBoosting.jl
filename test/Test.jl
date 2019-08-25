@@ -71,3 +71,11 @@ X_binned = apply_bins(X, bin_splits)
 
 println(predict_on_binned(X_binned, trees))
 println(y)
+
+println("Unbinned predictor")
+unbinned_predict = load_unbinned_predictor(save_path)
+
+println(unbinned_predict(X))
+println(y)
+
+@assert sum(abs.(predict_on_binned(X_binned, trees) - unbinned_predict(X))) < 0.00001

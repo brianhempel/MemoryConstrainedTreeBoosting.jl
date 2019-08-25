@@ -1,6 +1,6 @@
 module MemoryConstrainedTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, make_callback_to_track_validation_loss
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, load_unbinned_predictor, make_callback_to_track_validation_loss
 
 import Random
 
@@ -144,6 +144,22 @@ function load(path)
   (Vector{BinSplits{FeatureType}}(bin_splits), Vector{Tree}(trees))
 end
 
+# Returns a JIT-able function that takes in data and returns predictions.
+function load_unbinned_predictor(path)
+  bin_splits, trees = load(path)
+
+  tree_funcs = map(tree -> tree_to_function(bin_splits, tree), trees)
+
+  predict(X) = begin
+    thread_scores = map(_ -> zeros(Score, data_count(X)), 1:Threads.nthreads())
+
+    Threads.@threads for tree_func in tree_funcs
+      tree_func(X, thread_scores[Threads.threadid()])
+    end
+
+    σ.(sum(thread_scores))
+  end
+end
 
 function print_tree(tree, level = 0; feature_i_to_name = nothing)
   indentation = repeat("    ", level)
@@ -304,6 +320,34 @@ function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) ::
   end
 
   scores
+end
+
+# Returns a function tree_func(X, scores) that runs the tree on the data X and mutates scores
+function tree_to_function(bin_splits, tree)
+  tree_func_exp = quote
+    (X, scores) -> begin
+      for i in 1:data_count(X)
+        $(tree_to_exp(bin_splits, tree))
+      end
+    end
+  end
+  eval(tree_func_exp)
+end
+
+function tree_to_exp(bin_splits, node :: Node)
+  quote
+    if X[i, $(node.feature_i)] <= $(bin_splits[node.feature_i][node.split_i])
+      $(tree_to_exp(bin_splits, node.left))
+    else
+      $(tree_to_exp(bin_splits, node.right))
+    end
+  end
+end
+
+function tree_to_exp(bin_splits, leaf :: Leaf)
+  quote
+    scores[i] += $(leaf.Δscore)
+  end
 end
 
 
