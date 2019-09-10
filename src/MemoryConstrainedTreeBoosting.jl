@@ -306,37 +306,43 @@ end
 function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   Threads.@threads for i in 1:data_count(X_binned)
   # for i in 1:data_count(X_binned)
-    @inbounds begin
-      node = tree
-      while !isa(node, Leaf)
-        if X_binned[i, node.feature_i] <= node.split_i
-          node = node.left
-        else
-          node = node.right
-        end
-      end
-      scores[i] += node.Δscore
-    end
+    # Multi-dispatch is faster and fewer allocations that trying to do this in a loop.
+    apply_tree_to_datapoint!(X_binned, i, tree, scores)
   end
-
   scores
 end
 
-# Returns a function tree_func(X, scores) that runs the tree on the data X and mutates scores
+# Mutates scores.
+function apply_tree_to_datapoint!(X_binned :: Data, i :: Int64, node :: Node, scores :: Vector{Score})
+  if X_binned[i, node.feature_i] <= node.split_i
+    apply_tree_to_datapoint!(X_binned, i, node.left, scores)
+  else
+    apply_tree_to_datapoint!(X_binned, i, node.right, scores)
+  end
+end
+
+# Mutates scores.
+function apply_tree_to_datapoint!(X_binned :: Data, i :: Int64, leaf :: Leaf, scores :: Vector{Score})
+  scores[i] += leaf.Δscore
+  ()
+end
+
+# Returns a function tree_func(X, scores) that runs the tree on unbinned data X and mutates scores
 function tree_to_function(bin_splits, tree)
-  tree_func_exp = quote
+  eval(quote
     (X, scores) -> begin
       for i in 1:data_count(X)
         $(tree_to_exp(bin_splits, tree))
       end
     end
-  end
-  eval(tree_func_exp)
+  end)
 end
 
+# If bin_splits == nothing, then assumes the data is already binned
 function tree_to_exp(bin_splits, node :: Node)
+  threshold = isnothing(bin_splits) ? node.split_i : bin_splits[node.feature_i][node.split_i]
   quote
-    if X[i, $(node.feature_i)] <= $(bin_splits[node.feature_i][node.split_i])
+    if X[i, $(node.feature_i)] <= $(threshold)
       $(tree_to_exp(bin_splits, node.left))
     else
       $(tree_to_exp(bin_splits, node.right))
