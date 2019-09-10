@@ -78,14 +78,14 @@ mutable struct Node <: Tree
   split_i             :: UInt8
   left                :: Tree
   right               :: Tree
-  features_histograms :: Vector{Histogram} # Transient. Used to speed up tree calculation.
+  features_histograms :: Vector{Union{Histogram,Nothing}} # Transient. Used to speed up tree calculation.
 end
 
 mutable struct Leaf <: Tree
   Δscore                :: Score # Called "weight" in the literature
-  is                    :: Union{Vector{Int64},Nothing}  # Transient. Needed during tree growing.
-  maybe_split_candidate :: Union{SplitCandidate,Nothing} # Transient. Needed during tree growing.
-  features_histograms   :: Vector{Histogram}             # Transient. Used to speed up tree calculation.
+  is                    :: Union{UnitRange{Int64},Vector{Int64},Nothing} # Transient. Needed during tree growing.
+  maybe_split_candidate :: Union{SplitCandidate,Nothing}                 # Transient. Needed during tree growing.
+  features_histograms   :: Vector{Union{Histogram,Nothing}}              # Transient. Used to speed up tree calculation.
 
   Leaf(Δscore, is = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, maybe_split_candidate, features_histograms)
 end
@@ -637,7 +637,13 @@ end
 
 
 function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
-  tree = Leaf(optimal_Δscore(y, ŷ, weights, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))), collect(1:length(y)), nothing, [])
+  tree =
+    Leaf(
+      optimal_Δscore(y, ŷ, weights, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
+      1:length(y),
+      nothing, # maybe_split_candidate
+      []       # feature_histograms
+    )
 
   features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
 
@@ -712,12 +718,19 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
       # Expected Δlogloss at leaf = -0.5 * (Σ ∇loss)² / (Σ ∇∇loss)
 
       if isempty(leaf.features_histograms)
-        leaf.features_histograms = map(_ -> Histogram(max_bins), 1:feature_count(X_binned))
+        leaf.features_histograms = map(_ -> nothing, 1:feature_count(X_binned))
+      end
+
+      for feature_i in feature_is
+        perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i, tree, leaf)
       end
 
       Threads.@threads for feature_i in feature_is
       # for feature_i in feature_is
-        calculate_feature_histogram!(X_binned, y, ŷ, weights, feature_i, tree, leaf)
+        if isnothing(leaf.features_histograms[feature_i])
+          leaf.features_histograms[feature_i] =
+            calculate_feature_histogram(X_binned, y, ŷ, weights, feature_i, leaf.is)
+        end
       end
 
       leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
@@ -769,6 +782,39 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
   end
 end
 
+# If the parent cached its histogram, and the other sibling has already done its calculation, then we can calculate our histogram by simple subtraction.
+#
+# Possibly mutates leaf.feature_histograms[feature_i]
+function perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i, tree, leaf)
+  if !isnothing(leaf.features_histograms[feature_i])
+    return ()
+  end
+
+  max_bins = Int64(typemax(UInt8))
+
+  parent = parent_node(tree, leaf)
+  if parent != nothing
+    sibling = (parent.left === leaf ? parent.right : parent.left)
+
+    if parent != nothing && !isempty(parent.features_histograms) && !isempty(sibling.features_histograms)
+      parent_histogram  = parent.features_histograms[feature_i]
+      sibling_histogram = sibling.features_histograms[feature_i]
+
+      if !isnothing(parent_histogram) && !isnothing(sibling_histogram)
+        histogram = Histogram(max_bins)
+
+        histogram.Σ∇losses     .= parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses
+        histogram.Σ∇∇losses    .= parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses
+        histogram.data_weights .= parent_histogram.data_weights .- sibling_histogram.data_weights
+
+        leaf.features_histograms[feature_i] = histogram
+      end
+    end
+  end
+
+  ()
+end
+
 # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
 #
 # Its own method because it's faster that way.
@@ -815,54 +861,37 @@ function build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf_is, Σ∇
   ()
 end
 
-# Calculates and sets leaf.features_histograms[feature_i]
-function calculate_feature_histogram!(X_binned :: Data, y, ŷ, weights, feature_i, tree, leaf)
+# Calculates and returns the histogram for feature_i over leaf_is
+function calculate_feature_histogram(X_binned :: Data, y, ŷ, weights, feature_i, leaf_is)
 
   max_bins = Int64(typemax(UInt8))
 
-  histogram = leaf.features_histograms[feature_i]
+  histogram = Histogram(max_bins)
 
-  # If the parent cached its histogram, and the other sibling has already done its calculation, then we can calculate our histogram by simple subtraction.
-  parent = parent_node(tree, leaf)
-  if parent != nothing
-    sibling = (parent.left === leaf ? parent.right : parent.left)
+  feature_binned = get_feature(X_binned, feature_i)
+
+  Σ∇losses     = histogram.Σ∇losses
+  Σ∇∇losses    = histogram.Σ∇∇losses
+  data_weights = histogram.data_weights
+
+  build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+
+  # The last couple points...
+  @inbounds for ii in ((1:3:(length(leaf_is)-2)).stop + 3):length(leaf_is)
+    i = leaf_is[ii]
+    bin_i = feature_binned[i]
+
+    data_point_weight = weights[i]
+
+    ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
+    ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
+
+    Σ∇losses[bin_i]     += ∇loss
+    Σ∇∇losses[bin_i]    += ∇∇loss
+    data_weights[bin_i] += data_point_weight
   end
 
-  if parent != nothing && !isempty(parent.features_histograms) && !isempty(sibling.features_histograms)
-    # Expediated histogram calculation.
-    parent_histogram  = parent.features_histograms[feature_i]
-    sibling_histogram = sibling.features_histograms[feature_i]
-
-    histogram.Σ∇losses     .= parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses
-    histogram.Σ∇∇losses    .= parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses
-    histogram.data_weights .= parent_histogram.data_weights .- sibling_histogram.data_weights
-  else
-    # Can't expediate hist_bin calculation.
-    feature_binned = get_feature(X_binned, feature_i)
-
-    Σ∇losses     = histogram.Σ∇losses
-    Σ∇∇losses    = histogram.Σ∇∇losses
-    data_weights = histogram.data_weights
-
-    build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf.is, Σ∇losses, Σ∇∇losses, data_weights)
-
-    # The last couple points...
-    @inbounds for ii in ((1:3:(length(leaf.is)-2)).stop + 3):length(leaf.is)
-      i = leaf.is[ii]
-      bin_i = feature_binned[i]
-
-      data_point_weight = weights[i]
-
-      ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
-      ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
-
-      Σ∇losses[bin_i]     += ∇loss
-      Σ∇∇losses[bin_i]    += ∇∇loss
-      data_weights[bin_i] += data_point_weight
-    end
-  end
-
-  ()
+  histogram
 end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
@@ -876,6 +905,10 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
 
   for feature_i in feature_is
     histogram = features_histograms[feature_i]
+
+    if isnothing(histogram)
+      continue
+    end
 
     Σ∇losses     = histogram.Σ∇losses
     Σ∇∇losses    = histogram.Σ∇∇losses
