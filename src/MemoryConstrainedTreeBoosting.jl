@@ -939,51 +939,65 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
       continue
     end
 
-    Σ∇losses     = histogram.Σ∇losses
-    Σ∇∇losses    = histogram.Σ∇∇losses
-    data_weights = histogram.data_weights
+    expected_Δloss, split_i = best_split_for_feature(histogram, min_data_weight_in_leaf, l2_regularization, max_delta_score)
 
-    this_leaf_Σ∇loss      = sum(Σ∇losses)
-    this_leaf_Σ∇∇loss     = sum(Σ∇∇losses)
-    this_leaf_data_weight = sum(data_weights)
-
-    this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
-
-    left_Σ∇loss      = 0.0f0
-    left_Σ∇∇loss     = 0.0f0
-    left_data_weight = 0.0f0
-
-    @inbounds for bin_i in UInt8(1):UInt8(max_bins-1)
-      left_Σ∇loss      += Σ∇losses[bin_i]
-      left_Σ∇∇loss     += Σ∇∇losses[bin_i]
-      left_data_weight += data_weights[bin_i]
-
-      if left_data_weight < min_data_weight_in_leaf
-        continue
-      end
-
-      right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
-      right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
-      right_data_weight = this_leaf_data_weight - left_data_weight
-
-      if right_data_weight < min_data_weight_in_leaf
-        break
-      end
-
-      expected_Δloss =
-        -this_leaf_expected_Δloss +
-        leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
-        leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
-
-      if expected_Δloss < best_expected_Δloss
-        best_expected_Δloss = expected_Δloss
-        best_feature_i      = feature_i
-        best_split_i        = bin_i
-      end
-    end # for bin_i in 1:(max_bins-1)
+    if expected_Δloss < best_expected_Δloss
+      best_expected_Δloss = expected_Δloss
+      best_feature_i      = feature_i
+      best_split_i        = split_i
+    end
   end # for feature_i in feature_is
 
   SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
+end
+
+# Returns (expected_Δloss, best_split_i)
+function best_split_for_feature(histogram, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+  best_expected_Δloss, best_split_i = (Loss(0.0), UInt8(0))
+
+  Σ∇losses     = histogram.Σ∇losses
+  Σ∇∇losses    = histogram.Σ∇∇losses
+  data_weights = histogram.data_weights
+
+  this_leaf_Σ∇loss      = sum(Σ∇losses)
+  this_leaf_Σ∇∇loss     = sum(Σ∇∇losses)
+  this_leaf_data_weight = sum(data_weights)
+
+  this_leaf_expected_Δloss = leaf_expected_Δloss(this_leaf_Σ∇loss, this_leaf_Σ∇∇loss, l2_regularization, max_delta_score)
+
+  left_Σ∇loss      = 0.0f0
+  left_Σ∇∇loss     = 0.0f0
+  left_data_weight = 0.0f0
+
+  @inbounds for bin_i in UInt8(1):UInt8(max_bins-1)
+    left_Σ∇loss      += Σ∇losses[bin_i]
+    left_Σ∇∇loss     += Σ∇∇losses[bin_i]
+    left_data_weight += data_weights[bin_i]
+
+    if left_data_weight < min_data_weight_in_leaf
+      continue
+    end
+
+    right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
+    right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
+    right_data_weight = this_leaf_data_weight - left_data_weight
+
+    if right_data_weight < min_data_weight_in_leaf
+      break
+    end
+
+    expected_Δloss =
+      -this_leaf_expected_Δloss +
+      leaf_expected_Δloss(left_Σ∇loss,  left_Σ∇∇loss,  l2_regularization, max_delta_score) +
+      leaf_expected_Δloss(right_Σ∇loss, right_Σ∇∇loss, l2_regularization, max_delta_score)
+
+    if expected_Δloss < best_expected_Δloss
+      best_expected_Δloss = expected_Δloss
+      best_split_i        = bin_i
+    end
+  end # for bin_i in 1:(max_bins-1)
+
+  (best_expected_Δloss, best_split_i)
 end
 
 end # module MemoryConstrainedTreeBoosting
