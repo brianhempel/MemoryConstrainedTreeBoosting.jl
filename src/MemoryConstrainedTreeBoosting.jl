@@ -578,8 +578,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
       duration = @elapsed begin
         (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
 
-        ŷ = σ.(scores)
-        iteration_loss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
+        # iteration_loss = compute_mean_logloss(y, scores, weights)
         # println(ŷ)
         # println("Iteration $iteration_i training loss: $iteration_loss")
 
