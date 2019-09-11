@@ -120,9 +120,9 @@ end
 
 mutable struct Leaf <: Tree
   Δscore                :: Score # Called "weight" in the literature
-  is                    :: Union{UnitRange{Int64},Vector{Int64},Nothing} # Transient. Needed during tree growing.
-  maybe_split_candidate :: Union{SplitCandidate,Nothing}                 # Transient. Needed during tree growing.
-  features_histograms   :: Vector{Union{Histogram,Nothing}}              # Transient. Used to speed up tree calculation.
+  is                                                        # Transient. Needed during tree growing.
+  maybe_split_candidate :: Union{SplitCandidate,Nothing}    # Transient. Needed during tree growing.
+  features_histograms   :: Vector{Union{Histogram,Nothing}} # Transient. Used to speed up tree calculation.
 
   Leaf(Δscore, is = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, maybe_split_candidate, features_histograms)
 end
@@ -690,10 +690,11 @@ function bagged_weights(weights, bagging_temperature, weights_scratch = nothing)
 end
 
 function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
+  all_is = length(y) < typemax(UInt32) ? (UInt32(1):UInt32(length(y))) : (1:length(y)) # less memory, although not really faster
   tree =
     Leaf(
       optimal_Δscore(y, ŷ, weights, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
-      1:length(y),
+      all_is,
       nothing, # maybe_split_candidate
       []       # feature_histograms
     )
