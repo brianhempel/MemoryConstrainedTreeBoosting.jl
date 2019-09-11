@@ -493,10 +493,10 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
       validation_loss = sum(logloss.(validation_y, validation_ŷ) .* validation_weights) / sum(validation_weights)
     end
 
+    print("\rValidation loss: $validation_loss    ")
     if validation_loss < best_loss
       best_loss                      = validation_loss
       iterations_without_improvement = 0
-      print("\rValidation loss: $validation_loss    ")
     else
       iterations_without_improvement += 1
       if iterations_without_improvement >= max_iterations_without_improvement
@@ -575,8 +575,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
-      # @time begin
-      begin
+      duration = @elapsed begin
         (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
 
         ŷ = σ.(scores)
@@ -593,6 +592,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
           get_config_field(config, :iteration_callback)(trees)
         end
       end
+      print("$duration sec/tree     ")
     end
   catch expection
     println()
