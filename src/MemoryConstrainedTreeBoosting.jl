@@ -46,6 +46,8 @@ const DataWeight = Float32
 
 const BinSplits = Vector{T} where T <: AbstractFloat
 
+const max_bins = Int64(typemax(UInt8))
+
 const Data = Array{UInt8,2}
 
 data_count(X :: Array{<:Number,2}) = size(X,1)
@@ -264,12 +266,12 @@ end
 
 
 # Mutates tree, but returns the entire tree since old may be the root.
-function replace_leaf(tree, old, replacement)
+function replace_leaf!(tree, old, replacement)
   if tree === old
     replacement
   elseif isa(tree, Node)
-    tree.left  = replace_leaf(tree.left,  old, replacement)
-    tree.right = replace_leaf(tree.right, old, replacement)
+    tree.left  = replace_leaf!(tree.left,  old, replacement)
+    tree.right = replace_leaf!(tree.right, old, replacement)
     tree
   else
     tree
@@ -680,19 +682,45 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε)
 # Derivatives with respect to margin (i.e. pre-sigmoid values, but you still provide the post-sigmoid probability).
 #
 # It's a bit of math but it works out nicely. (Verified against XGBoost.)
-∇logloss(y, ŷ) = ŷ - y
-∇∇logloss(ŷ)   = ŷ * (1.0f0 - ŷ) # Interestingly, not dependent on y. XGBoost adds an ε term
+@inline ∇logloss(y, ŷ) = ŷ - y
+@inline ∇∇logloss(ŷ)   = ŷ * (1.0f0 - ŷ) # Interestingly, not dependent on y. XGBoost adds an ε term
 
 
 # Assuming binary classification with log loss.
 function optimal_Δscore(y :: AbstractArray{Prediction}, ŷ :: AbstractArray{Prediction}, weights :: AbstractArray{DataWeight}, l2_regularization :: Loss, max_delta_score :: Score)
-  Σ∇loss  = sum(∇logloss.(y, ŷ) .* weights)
-  Σ∇∇loss = sum(∇∇logloss.(ŷ)   .* weights)
+  Σ∇loss, Σ∇∇loss = compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
 
   # And the loss minima is at:
   clamp(-Σ∇loss / (Σ∇∇loss + l2_regularization + ε), -max_delta_score, max_delta_score)
 end
 
+function compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
+  # Σ∇loss  = sum(∇logloss.(y, ŷ) .* weights)
+  # Σ∇∇loss = sum(∇∇logloss.(ŷ)   .* weights)
+
+  thread_Σ∇losses  = zeros(Loss, Threads.nthreads())
+  thread_Σ∇∇losses = zeros(Loss, Threads.nthreads())
+
+  Threads.@threads for thread_i in 1:Threads.nthreads()
+  # for thread_i in 1:Threads.nthreads()
+    start = div((thread_i-1) * length(y), Threads.nthreads()) + 1
+    stop  = div( thread_i    * length(y), Threads.nthreads())
+    thread_Σ∇losses[thread_i], thread_Σ∇∇losses[thread_i] =
+      _compute_Σ∇loss_Σ∇∇loss(start:stop, y, ŷ, weights)
+  end
+
+  (sum(thread_Σ∇losses), sum(thread_Σ∇∇losses))
+end
+
+function _compute_Σ∇loss_Σ∇∇loss(range, y, ŷ, weights)
+  Σ∇loss  = zero(Loss)
+  Σ∇∇loss = zero(Loss)
+  @inbounds for i in range
+    Σ∇loss  += (ŷ[i] - y[i])         * weights[i] # ∇logloss  = ŷ - y
+    Σ∇∇loss += ŷ[i] * (1.0f0 - ŷ[i]) * weights[i] # ∇∇logloss = ŷ * (1.0f0 - ŷ)
+  end
+  (Σ∇loss, Σ∇∇loss)
+end
 
 # -0.5 * (Σ∇loss)² / (Σ∇∇loss) in XGBoost paper; but can't simplify so much if clamping the score.
 function leaf_expected_Δloss(Σ∇loss :: Loss, Σ∇∇loss :: Loss, l2_regularization :: Loss, max_delta_score :: Score)
@@ -707,8 +735,6 @@ end
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
 function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; config...)
   leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
-
-  max_bins = Int64(typemax(UInt8))
 
   if length(leaves) >= get_config_field(config, :max_leaves)
     return (false, tree)
@@ -730,7 +756,8 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
         leaf.features_histograms = map(_ -> nothing, 1:feature_count(X_binned))
       end
 
-      for feature_i in feature_is
+      # Don't really need threads on this one but it doesn't hurt.
+      Threads.@threads for feature_i in feature_is
         perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i, tree, leaf)
       end
 
@@ -783,7 +810,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
 
     new_node = Node(feature_i, split_i, left_leaf, right_leaf, leaf_to_split.features_histograms)
 
-    tree = replace_leaf(tree, leaf_to_split, new_node)
+    tree = replace_leaf!(tree, leaf_to_split, new_node)
 
     (true, tree)
   else
@@ -798,8 +825,6 @@ function perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i,
   if !isnothing(leaf.features_histograms[feature_i])
     return ()
   end
-
-  max_bins = Int64(typemax(UInt8))
 
   parent = parent_node(tree, leaf)
   if parent != nothing
@@ -873,8 +898,6 @@ end
 # Calculates and returns the histogram for feature_i over leaf_is
 function calculate_feature_histogram(X_binned :: Data, y, ŷ, weights, feature_i, leaf_is)
 
-  max_bins = Int64(typemax(UInt8))
-
   histogram = Histogram(max_bins)
 
   feature_binned = get_feature(X_binned, feature_i)
@@ -905,9 +928,6 @@ end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
-  # Shouldn't be a slowdown if using fewer bins: the loop already aborts when there's not enough data on the other side of a split.
-  max_bins = Int64(typemax(UInt8))
-
   best_expected_Δloss, best_feature_i, best_split_i = (Loss(0.0), 0, UInt8(0))
 
   # This should be fast enough that threading won't help, because it's only O(max_bins*feature_count).
