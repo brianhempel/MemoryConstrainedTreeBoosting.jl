@@ -622,14 +622,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   weights =
     # Adapted from Catboost
     if bagging_temperature > 0.0f0
-      map(weights) do weight
-        r = -log(rand(Float32) + ε)
-        if bagging_temperature != 1.0f0
-          weight * r^bagging_temperature
-        else
-          weight * r
-        end
-      end
+      bagged_weights(weights, bagging_temperature)
     else
       weights
     end
@@ -641,6 +634,16 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   (new_scores, tree)
 end
 
+function bagged_weights(weights, bagging_temperature)
+  out = rand(Float32, length(weights))
+
+  @inbounds Threads.@threads for i in 1:length(weights)
+    r = -log(out[i] + ε)
+    out[i] = weights[i] * (bagging_temperature != 1.0f0 ? r^bagging_temperature : r)
+  end
+
+  out
+end
 
 function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
   tree =
