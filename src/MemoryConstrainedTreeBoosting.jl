@@ -24,6 +24,23 @@ function parallel_iterate(f, count)
   Tuple(collect.(zip(thread_results...)))
 end
 
+function parallel_map(f, T, in)
+  out = Vector{T}(undef, length(in))
+  parallel_map!(f, out, in)
+end
+
+function parallel_map!(f, out, in)
+  Threads.@threads for i in 1:length(in)
+    out[i] = f(in[i])
+  end
+  out
+end
+
+struct Const
+  x
+end
+Base.getindex(c::Const, i::Int) = c.x
+
 
 default_config = (
   weights                            = nothing, # weights for the data
@@ -412,7 +429,7 @@ function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_s
   if output_raw_scores
     scores
   else
-    σ.(scores)
+    parallel_map!(σ, scores, scores)
   end
 end
 
@@ -512,12 +529,7 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
     else
       validation_scores = predict_on_binned(validation_X_binned, [new_tree], starting_scores = validation_scores, output_raw_scores = true)
     end
-    validation_ŷ = σ.(validation_scores)
-    if isnothing(validation_weights)
-      validation_loss = sum(logloss.(validation_y, validation_ŷ)) / length(validation_y)
-    else
-      validation_loss = sum(logloss.(validation_y, validation_ŷ) .* validation_weights) / sum(validation_weights)
-    end
+    validation_loss = compute_mean_logloss(validation_y, validation_scores, validation_weights)
 
     print("\rValidation loss: $validation_loss    ")
     if validation_loss < best_loss
@@ -583,7 +595,7 @@ end
 function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
   if weights == nothing
-    weights = fill(DataWeight(1.0), length(y))
+    weights = fill(one(DataWeight), length(y))
   end
 
   if isempty(prior_trees)
@@ -599,10 +611,15 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   trees = copy(prior_trees)
 
+  # Scratch memory to avoid allocations.
+  ŷ_scratch       = Vector{Prediction}(undef, length(y))
+  weights_scratch = get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(weights)) : nothing
+
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
       duration = @elapsed begin
-        (scores, tree) = train_one_iteration(X_binned, y, weights, scores, length(trees); config...)
+        tree = train_one_iteration(X_binned, y, weights, scores; ŷ_scratch = ŷ_scratch, weights_scratch = weights_scratch, config...)
+        apply_tree!(X_binned, tree, scores)
 
         # iteration_loss = compute_mean_logloss(y, scores, weights)
         # println(ŷ)
@@ -631,35 +648,42 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 end
 
 
-# Returns (new_scores, tree)
-function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}, prior_tree_count; config...) :: Tuple{Vector{Score}, Tree}
-  ŷ = σ.(scores)
-  # println(ŷ)
+# Returns new tree
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; ŷ_scratch = nothing, weights_scratch = nothing, config...) :: Tree
+  ŷ =
+    if isnothing(ŷ_scratch)
+      parallel_map(σ, Prediction, scores)
+    else
+      parallel_map!(σ, ŷ_scratch, scores)
+    end
 
   learning_rate       = Score(get_config_field(config, :learning_rate))
   bagging_temperature = DataWeight(get_config_field(config, :bagging_temperature))
 
   weights =
     # Adapted from Catboost
-    if bagging_temperature > 0.0f0
-      bagged_weights(weights, bagging_temperature)
+    if bagging_temperature > 0
+      bagged_weights(weights, bagging_temperature, weights_scratch)
     else
       weights
     end
 
   tree = build_one_tree(X_binned, y, ŷ, weights; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
-  new_scores = copy(scores)
-  apply_tree!(X_binned, tree, new_scores)
-  (new_scores, tree)
+  tree
 end
 
-function bagged_weights(weights, bagging_temperature)
-  out = rand(Float32, length(weights))
+function bagged_weights(weights, bagging_temperature, weights_scratch = nothing)
+  out = isnothing(weights_scratch) ? Vector{DataWeight}(undef, length(weights)) : weights_scratch
+  seed = rand(Int)
 
-  @inbounds Threads.@threads for i in 1:length(weights)
-    r = -log(out[i] + ε)
-    out[i] = weights[i] * (bagging_temperature != 1.0f0 ? r^bagging_temperature : r)
+  parallel_iterate(length(weights)) do thread_range
+    rng = Random.MersenneTwister(abs(seed + thread_range.start * 1234))
+    @inbounds for i in thread_range
+      r = -log(rand(rng, DataWeight) + ε)
+      out[i] = weights[i] * (bagging_temperature != 1.0f0 ? r^bagging_temperature : r)
+    end
+    ()
   end
 
   out
@@ -704,6 +728,28 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε)
 @inline ∇∇logloss(ŷ)   = ŷ * (1.0f0 - ŷ) # Interestingly, not dependent on y. XGBoost adds an ε term
 
 
+function compute_mean_logloss(y, scores, weights = nothing)
+  weights = isnothing(weights) ? Const(one(DataWeight)) : weights
+  _compute_mean_logloss(y, scores, weights)
+end
+
+function _compute_mean_logloss(y, scores, weights)
+  # Broadcast version, which performs allocations:
+  # ŷ = σ.(scores)
+  # mean_logloss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
+  thread_Σlosses, thread_Σweights = parallel_iterate(length(y)) do thread_range
+    Σloss   = zero(Loss)
+    Σweight = zero(DataWeight)
+    @inbounds for i in thread_range
+      ŷ_i      = σ(scores[i])
+      Σloss   += logloss(y[i], ŷ_i) * weights[i]
+      Σweight += weights[i]
+    end
+    (Σloss, Σweight)
+  end
+  sum(thread_Σlosses) / sum(thread_Σweights)
+end
+
 # Assuming binary classification with log loss.
 function optimal_Δscore(y :: AbstractArray{Prediction}, ŷ :: AbstractArray{Prediction}, weights :: AbstractArray{DataWeight}, l2_regularization :: Loss, max_delta_score :: Score)
   Σ∇loss, Σ∇∇loss = compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
@@ -713,11 +759,11 @@ function optimal_Δscore(y :: AbstractArray{Prediction}, ŷ :: AbstractArray{Pre
 end
 
 function compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
-  thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(y)) do range
+  thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(y)) do thread_range
     # _compute_Σ∇loss_Σ∇∇loss(range, y, ŷ, weights)
     Σ∇loss  = zero(Loss)
     Σ∇∇loss = zero(Loss)
-    @inbounds for i in range
+    @inbounds for i in thread_range
       Σ∇loss  += (ŷ[i] - y[i])         * weights[i] # ∇logloss  = ŷ - y
       Σ∇∇loss += ŷ[i] * (1.0f0 - ŷ[i]) * weights[i] # ∇∇logloss = ŷ * (1.0f0 - ŷ)
     end
