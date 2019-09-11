@@ -7,6 +7,24 @@ import Random
 import BSON
 
 
+# f should be a function that take an indices_range and returns a tuple of reduction values
+#
+# parallel_iterate will unzip those tuples into a tuple of arrays of reduction values and return that.
+function parallel_iterate(f, count)
+  thread_results = Vector{Any}(undef, Threads.nthreads())
+
+  Threads.@threads for thread_i in 1:Threads.nthreads()
+  # for thread_i in 1:Threads.nthreads()
+    start = div((thread_i-1) * count, Threads.nthreads()) + 1
+    stop  = div( thread_i    * count, Threads.nthreads())
+    thread_results[thread_i] = f(start:stop)
+  end
+
+  # Mangling so you get a tuple of arrays.
+  Tuple(collect.(zip(thread_results...)))
+end
+
+
 default_config = (
   weights                            = nothing, # weights for the data
   bin_count                          = 255,
@@ -695,31 +713,18 @@ function optimal_Δscore(y :: AbstractArray{Prediction}, ŷ :: AbstractArray{Pre
 end
 
 function compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
-  # Σ∇loss  = sum(∇logloss.(y, ŷ) .* weights)
-  # Σ∇∇loss = sum(∇∇logloss.(ŷ)   .* weights)
-
-  thread_Σ∇losses  = zeros(Loss, Threads.nthreads())
-  thread_Σ∇∇losses = zeros(Loss, Threads.nthreads())
-
-  Threads.@threads for thread_i in 1:Threads.nthreads()
-  # for thread_i in 1:Threads.nthreads()
-    start = div((thread_i-1) * length(y), Threads.nthreads()) + 1
-    stop  = div( thread_i    * length(y), Threads.nthreads())
-    thread_Σ∇losses[thread_i], thread_Σ∇∇losses[thread_i] =
-      _compute_Σ∇loss_Σ∇∇loss(start:stop, y, ŷ, weights)
+  thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(y)) do range
+    # _compute_Σ∇loss_Σ∇∇loss(range, y, ŷ, weights)
+    Σ∇loss  = zero(Loss)
+    Σ∇∇loss = zero(Loss)
+    @inbounds for i in range
+      Σ∇loss  += (ŷ[i] - y[i])         * weights[i] # ∇logloss  = ŷ - y
+      Σ∇∇loss += ŷ[i] * (1.0f0 - ŷ[i]) * weights[i] # ∇∇logloss = ŷ * (1.0f0 - ŷ)
+    end
+    (Σ∇loss, Σ∇∇loss)
   end
 
   (sum(thread_Σ∇losses), sum(thread_Σ∇∇losses))
-end
-
-function _compute_Σ∇loss_Σ∇∇loss(range, y, ŷ, weights)
-  Σ∇loss  = zero(Loss)
-  Σ∇∇loss = zero(Loss)
-  @inbounds for i in range
-    Σ∇loss  += (ŷ[i] - y[i])         * weights[i] # ∇logloss  = ŷ - y
-    Σ∇∇loss += ŷ[i] * (1.0f0 - ŷ[i]) * weights[i] # ∇∇logloss = ŷ * (1.0f0 - ŷ)
-  end
-  (Σ∇loss, Σ∇∇loss)
 end
 
 # -0.5 * (Σ∇loss)² / (Σ∇∇loss) in XGBoost paper; but can't simplify so much if clamping the score.
