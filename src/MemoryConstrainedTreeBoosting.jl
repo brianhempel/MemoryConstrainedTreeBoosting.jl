@@ -36,6 +36,29 @@ function parallel_map!(f, out, in)
   out
 end
 
+function partition(f, in)
+  trues   = Vector{eltype(in)}(undef, length(in))
+  falses  = Vector{eltype(in)}(undef, length(in))
+  true_i  = 1
+  false_i = 1
+
+  @inbounds for i in 1:length(in)
+    elem = in[i]
+    if f(elem)
+      trues[true_i] = elem
+      true_i += 1
+    else
+      falses[false_i] = elem
+      false_i += 1
+    end
+  end
+
+  resize!(trues,  true_i-1)
+  resize!(falses, false_i-1)
+
+  (trues, falses)
+end
+
 struct Const
   x
 end
@@ -843,9 +866,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
 
     feature_binned = get_feature(X_binned, feature_i)
 
-    # Can't seem to get it faster than this version.
-    left_is  = filter(i -> feature_binned[i] <= split_i, leaf_to_split.is)
-    right_is = filter(i -> feature_binned[i] >  split_i, leaf_to_split.is)
+    left_is, right_is = partition(i -> feature_binned[i] <= split_i, leaf_to_split.is)
 
     left_ys       = @view y[left_is]
     left_ŷs       = @view ŷ[left_is]
