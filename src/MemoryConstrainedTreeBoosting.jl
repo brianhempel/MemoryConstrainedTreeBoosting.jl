@@ -742,11 +742,28 @@ function bagged_weights(weights, bagging_temperature, weights_scratch = nothing)
   out = isnothing(weights_scratch) ? Vector{DataWeight}(undef, length(weights)) : weights_scratch
   seed = rand(Int)
 
+  # logs and powers are slow; sample from pre-computed distribution for non-extreme values.
+
+  weight_lookup = map(r -> (-log(r))^bagging_temperature, 0.005f0:0.01f0:0.995f0)
+  # Temperatures between 0 and 1 shift the expected effective total weight
+  # downward slightly (up to ~11.5%) which effectively changes the
+  # min_data_in_leaf and L2 regularization. Compensate.
+  temperature_compensation = length(weight_lookup) / sum(weight_lookup)
+  weight_lookup .*= temperature_compensation
+
   parallel_iterate(length(weights)) do thread_range
     rng = Random.MersenneTwister(abs(seed + thread_range.start * 1234))
     @inbounds for i in thread_range
-      r = -log(rand(rng, DataWeight) + ε)
-      out[i] = weights[i] * (bagging_temperature != 1.0f0 ? r^bagging_temperature : r)
+      bin_i = rand(rng, 1:100)
+      count =
+        if bin_i in 2:99
+          weight_lookup[bin_i]
+        else
+          r = rand(rng, DataWeight) * 0.01f0 + (bin_i == 100 ? 0.99f0 : ε)
+          (-log(r))^bagging_temperature * temperature_compensation
+        end
+
+      out[i] = weights[i] * count
     end
     ()
   end
