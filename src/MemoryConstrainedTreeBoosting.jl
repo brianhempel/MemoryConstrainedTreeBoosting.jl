@@ -702,7 +702,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   if isempty(prior_trees)
     initial_score = begin
-      probability = sum(y .* weights) / sum(weights)
+      probability = compute_mean_probability(y, weights)
       log(probability / (1-probability)) # inverse sigmoid
     end
 
@@ -854,6 +854,19 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε)
 @inline ∇logloss(y, ŷ) = ŷ - y
 @inline ∇∇logloss(ŷ)   = ŷ * (1.0f0 - ŷ) # Interestingly, not dependent on y. XGBoost adds an ε term
 
+
+function compute_mean_probability(y, weights)
+  thread_Σlabels, thread_Σweight = parallel_iterate(length(y)) do thread_range
+    Σlabel  = zero(Prediction)
+    Σweight = zero(DataWeight)
+    @inbounds for i in thread_range
+      Σlabel  += y[i] * weights[i]
+      Σweight += weights[i]
+    end
+    (Σlabel, Σweight)
+  end
+  sum(thread_Σlabels) / sum(thread_Σweight)
+end
 
 function compute_mean_logloss(y, scores, weights = nothing)
   weights = isnothing(weights) ? Const(one(DataWeight)) : weights
