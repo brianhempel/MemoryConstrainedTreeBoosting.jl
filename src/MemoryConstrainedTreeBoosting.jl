@@ -61,13 +61,22 @@ function partition(f, in)
   (trues, falses)
 end
 
-# Fast, at the cost of up to 3x max memory usage compared to growing the arrays dynamically non-parallel.
+# Fast, at the cost of 2x max memory usage compared to growing the arrays dynamically non-parallel.
+#
+# Returned arrays are views into the out array.
+# The original array is essentially sorted by the
+# truthiness of its values and we return views into
+# its first part (trues) and second part (falses).
+#
+# out and in can be the same array
 #
 # Each thread partitions one chunk of the array.
 # Then, based on the size of the partition chunks,
 # each thread copies its chunk into an appropriate
-# position in the final array.
-function parallel_partition(f, in)
+# position in the out array.
+function parallel_partition!(f, out :: AbstractArray{T}, in :: AbstractArray{T}) where T
+  @assert length(out) == length(in)
+
   # Partition in chunks.
   thread_trues, thread_falses = parallel_iterate(length(in)) do thread_range
     partition(f, @view in[thread_range])
@@ -81,12 +90,24 @@ function parallel_partition(f, in)
 
   # @assert trues_count + falses_count == length(in)
 
-  trues   = Vector{eltype(in)}(undef, trues_count)
-  falses  = Vector{eltype(in)}(undef, falses_count)
+  # trues   = Vector{eltype(in)}(undef, trues_count)
+  # falses  = Vector{eltype(in)}(undef, falses_count)
+  trues  = view(out, 1:trues_count)
+  falses = view(out, (trues_count+1):length(out))
 
   # @assert Threads.nthreads() == length(thread_trues)
   # @assert Threads.nthreads() == length(thread_falses)
 
+  _parallel_partition!(trues, falses, trues_end_indicies, falses_end_indicies, thread_trues, thread_falses)
+
+  # @assert trues  == filter(f, in)
+  # @assert falses == filter(x -> !f(x), in)
+
+  (trues, falses)
+end
+
+# Separate method; seems to save a few allocations.
+function _parallel_partition!(trues, falses, trues_end_indicies, falses_end_indicies, thread_trues, thread_falses)
   Threads.@threads for thread_i in 1:Threads.nthreads()
     trues_start_index  = 1 + (thread_i >= 2 ? trues_end_indicies[thread_i-1]  : 0)
     falses_start_index = 1 + (thread_i >= 2 ? falses_end_indicies[thread_i-1] : 0)
@@ -95,11 +116,7 @@ function parallel_partition(f, in)
     trues[trues_range]   = thread_trues[thread_i]
     falses[falses_range] = thread_falses[thread_i]
   end
-
-  # @assert trues  == filter(f, in)
-  # @assert falses == filter(x -> !f(x), in)
-
-  (trues, falses)
+  ()
 end
 
 struct Const
@@ -658,17 +675,25 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
   (bin_splits, trees)
 end
 
+index_type(array) = length(array) < typemax(UInt32) ? UInt32 : Int64
+
 # Reusable memory to avoid allocations between trees.
 mutable struct ScratchMemory
   ∇losses  :: Vector{Loss}
   ∇∇losses :: Vector{Loss}
   weights  :: Union{Nothing,Vector{DataWeight}}
+  is       :: Union{Vector{UInt32},Vector{Int64}}
+  # trues    :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
+  # falses   :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
 
   ScratchMemory(y, config) =
     new(
       Vector{Loss}(undef, length(y)),
       Vector{Loss}(undef, length(y)),
       get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(y)) : nothing,
+      Vector{index_type(y)}(undef, length(y)),
+      # Vector{index_type(y)}(undef, length(y)),
+      # Vector{index_type(y)}(undef, length(y)),
     )
 end
 
@@ -745,13 +770,14 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
       weights
     end
 
-  ∇losses  = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y)) : scratch_memory.∇losses
-  ∇∇losses = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y)) : scratch_memory.∇∇losses
+  ∇losses  = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y))          : scratch_memory.∇losses
+  ∇∇losses = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y))          : scratch_memory.∇∇losses
+  is       = isnothing(scratch_memory) ? Vector{index_type(y)}(undef, length(y)) : scratch_memory.is
 
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses, ∇∇losses, weights)
 
-  tree = build_one_tree(X_binned, ∇losses, ∇∇losses, weights; config...)
+  tree = build_one_tree(X_binned, ∇losses, ∇∇losses, weights, is; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
@@ -789,8 +815,9 @@ function bagged_weights(weights, bagging_temperature, weights_scratch = nothing)
   out
 end
 
-function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights; config...)
-  all_is = length(weights) < typemax(UInt32) ? (UInt32(1):UInt32(length(weights))) : (1:length(weights)) # less memory, although not really faster
+function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights, is; config...)
+  # Use a range rather than a list for the root. Saves us having to initialize is.
+  all_is = UnitRange{index_type(weights)}(1:length(weights))
   tree =
     Leaf(
       optimal_Δscore(∇losses, ∇∇losses, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
@@ -810,7 +837,7 @@ function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights; conf
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses, ∇∇losses, weights, feature_is; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses, ∇∇losses, weights, is, feature_is; config...)
   end
 
   tree
@@ -896,7 +923,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, weights, feature_is; config...)
+function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, weights, is, feature_is; config...)
   leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -954,7 +981,10 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
     feature_binned = get_feature(X_binned, feature_i)
 
-    left_is, right_is = parallel_partition(i -> feature_binned[i] <= split_i, leaf_to_split.is)
+    # If top level, switch from unit range to our scratch memory
+    scratch_is = isa(leaf_to_split.is, UnitRange) ? is : leaf_to_split.is
+
+    left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, leaf_to_split.is)
 
     left_∇losses   = @view ∇losses[left_is]
     left_∇∇losses  = @view ∇∇losses[left_is]
