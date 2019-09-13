@@ -24,14 +24,15 @@ function parallel_iterate(f, count)
   Tuple(collect.(zip(thread_results...)))
 end
 
-function parallel_map(f, T, in)
-  out = Vector{T}(undef, length(in))
-  parallel_map!(f, out, in)
-end
+# function parallel_map(f, T, in)
+#   out = Vector{T}(undef, length(in))
+#   parallel_map!(f, out, in)
+# end
 
 function parallel_map!(f, out, in)
+  @assert length(out) == length(in)
   Threads.@threads for i in 1:length(in)
-    out[i] = f(in[i])
+    @inbounds out[i] = f(in[i])
   end
   out
 end
@@ -657,6 +658,20 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
   (bin_splits, trees)
 end
 
+# Reusable memory to avoid allocations between trees.
+mutable struct ScratchMemory
+  ∇losses  :: Vector{Loss}
+  ∇∇losses :: Vector{Loss}
+  weights  :: Union{Nothing,Vector{DataWeight}}
+
+  ScratchMemory(y, config) =
+    new(
+      Vector{Loss}(undef, length(y)),
+      Vector{Loss}(undef, length(y)),
+      get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(y)) : nothing,
+    )
+end
+
 function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
   if weights == nothing
@@ -676,14 +691,13 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   trees = copy(prior_trees)
 
-  # Scratch memory to avoid allocations.
-  ŷ_scratch       = Vector{Prediction}(undef, length(y))
-  weights_scratch = get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(weights)) : nothing
+  scratch_memory = ScratchMemory(y, config)
 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
       duration = @elapsed begin
-        tree = train_one_iteration(X_binned, y, weights, scores; ŷ_scratch = ŷ_scratch, weights_scratch = weights_scratch, config...)
+        tree = train_one_iteration(X_binned, y, weights, scores; scratch_memory = scratch_memory, config...)
+        tree = strip_tree_training_info(tree) # For long boosting sessions, should save memory if we strip off the list of indices
         apply_tree!(X_binned, tree, scores)
 
         # iteration_loss = compute_mean_logloss(y, scores, weights)
@@ -693,7 +707,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
         # print_tree(tree; feature_i_to_name = get_config_field(config, :feature_i_to_name))
         # println()
 
-        push!(trees, strip_tree_training_info(tree)) # For long boosting sessions, should save memory if we strip off the list of indices
+        push!(trees, tree)
 
         if !isnothing(get_config_field(config, :iteration_callback))
           get_config_field(config, :iteration_callback)(trees)
@@ -709,31 +723,35 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
     end
   end
 
+  # scores         = nothing
+  # weights        = nothing
+  # scratch_memory = nothing
+  # GC.gc(true)
+
   trees
 end
 
 
 # Returns new tree
-function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; ŷ_scratch = nothing, weights_scratch = nothing, config...) :: Tree
-  ŷ =
-    if isnothing(ŷ_scratch)
-      parallel_map(σ, Prediction, scores)
-    else
-      parallel_map!(σ, ŷ_scratch, scores)
-    end
-
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, config...) :: Tree
   learning_rate       = Score(get_config_field(config, :learning_rate))
   bagging_temperature = DataWeight(get_config_field(config, :bagging_temperature))
 
   weights =
     # Adapted from Catboost
     if bagging_temperature > 0
-      bagged_weights(weights, bagging_temperature, weights_scratch)
+      bagged_weights(weights, bagging_temperature, isnothing(scratch_memory) ? nothing : scratch_memory.weights)
     else
       weights
     end
 
-  tree = build_one_tree(X_binned, y, ŷ, weights; config...)
+  ∇losses  = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y)) : scratch_memory.∇losses
+  ∇∇losses = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y)) : scratch_memory.∇∇losses
+
+  # Needs to be a separate method otherwise type inference croaks.
+  compute_∇losses_∇∇losses!(y, scores, ∇losses, ∇∇losses, weights)
+
+  tree = build_one_tree(X_binned, ∇losses, ∇∇losses, weights; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
@@ -771,11 +789,11 @@ function bagged_weights(weights, bagging_temperature, weights_scratch = nothing)
   out
 end
 
-function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = labels, ŷ = predictions so far
-  all_is = length(y) < typemax(UInt32) ? (UInt32(1):UInt32(length(y))) : (1:length(y)) # less memory, although not really faster
+function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights; config...)
+  all_is = length(weights) < typemax(UInt32) ? (UInt32(1):UInt32(length(weights))) : (1:length(weights)) # less memory, although not really faster
   tree =
     Leaf(
-      optimal_Δscore(y, ŷ, weights, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
+      optimal_Δscore(∇losses, ∇∇losses, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
       all_is,
       nothing, # maybe_split_candidate
       []       # feature_histograms
@@ -792,7 +810,7 @@ function build_one_tree(X_binned :: Data, y, ŷ, weights; config...) # y = label
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, y, ŷ, weights, feature_is; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses, ∇∇losses, weights, feature_is; config...)
   end
 
   tree
@@ -833,22 +851,33 @@ function _compute_mean_logloss(y, scores, weights)
   sum(thread_Σlosses) / sum(thread_Σweights)
 end
 
+# Stores results in ∇losses, ∇∇losses
+function compute_∇losses_∇∇losses!(y, scores, ∇losses, ∇∇losses, weights)
+  Threads.@threads for i in 1:length(y)
+    @inbounds begin
+      ŷ_i = σ(scores[i])
+      ∇losses[i]  = (ŷ_i - y[i])        * weights[i] # ∇logloss  = ŷ - y
+      ∇∇losses[i] = ŷ_i * (1.0f0 - ŷ_i) * weights[i] # ∇∇logloss = ŷ * (1.0f0 - ŷ)
+    end
+  end
+  ()
+end
+
 # Assuming binary classification with log loss.
-function optimal_Δscore(y :: AbstractArray{Prediction}, ŷ :: AbstractArray{Prediction}, weights :: AbstractArray{DataWeight}, l2_regularization :: Loss, max_delta_score :: Score)
-  Σ∇loss, Σ∇∇loss = compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
+function optimal_Δscore(∇losses :: AbstractArray{Loss}, ∇∇losses :: AbstractArray{Loss}, l2_regularization :: Loss, max_delta_score :: Score)
+  Σ∇loss, Σ∇∇loss = sum_∇loss_∇∇loss(∇losses, ∇∇losses)
 
   # And the loss minima is at:
   clamp(-Σ∇loss / (Σ∇∇loss + l2_regularization + ε), -max_delta_score, max_delta_score)
 end
 
-function compute_Σ∇loss_Σ∇∇loss(y, ŷ, weights)
-  thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(y)) do thread_range
-    # _compute_Σ∇loss_Σ∇∇loss(range, y, ŷ, weights)
+function sum_∇loss_∇∇loss(∇losses, ∇∇losses)
+  thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(∇losses)) do thread_range
     Σ∇loss  = zero(Loss)
     Σ∇∇loss = zero(Loss)
     @inbounds for i in thread_range
-      Σ∇loss  += (ŷ[i] - y[i])         * weights[i] # ∇logloss  = ŷ - y
-      Σ∇∇loss += ŷ[i] * (1.0f0 - ŷ[i]) * weights[i] # ∇∇logloss = ŷ * (1.0f0 - ŷ)
+      Σ∇loss  += ∇losses[i]
+      Σ∇∇loss += ∇∇losses[i]
     end
     (Σ∇loss, Σ∇∇loss)
   end
@@ -867,7 +896,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; config...)
+function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, weights, feature_is; config...)
   leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -899,7 +928,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
       # for feature_i in feature_is
         if isnothing(leaf.features_histograms[feature_i])
           leaf.features_histograms[feature_i] =
-            calculate_feature_histogram(X_binned, y, ŷ, weights, feature_i, leaf.is)
+            calculate_feature_histogram(X_binned, ∇losses, ∇∇losses, weights, feature_i, leaf.is)
         end
       end
 
@@ -927,15 +956,13 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
 
     left_is, right_is = parallel_partition(i -> feature_binned[i] <= split_i, leaf_to_split.is)
 
-    left_ys       = @view y[left_is]
-    left_ŷs       = @view ŷ[left_is]
-    right_ys      = @view y[right_is]
-    right_ŷs      = @view ŷ[right_is]
-    left_weights  = @view weights[left_is]
-    right_weights = @view weights[right_is]
+    left_∇losses   = @view ∇losses[left_is]
+    left_∇∇losses  = @view ∇∇losses[left_is]
+    right_∇losses  = @view ∇losses[right_is]
+    right_∇∇losses = @view ∇∇losses[right_is]
 
-    left_Δscore  = optimal_Δscore(left_ys,  left_ŷs,  left_weights,  l2_regularization, max_delta_score)
-    right_Δscore = optimal_Δscore(right_ys, right_ŷs, right_weights, l2_regularization, max_delta_score)
+    left_Δscore  = optimal_Δscore(left_∇losses,  left_∇∇losses,  l2_regularization, max_delta_score)
+    right_Δscore = optimal_Δscore(right_∇losses, right_∇∇losses, l2_regularization, max_delta_score)
 
     left_leaf  = Leaf(left_Δscore,  left_is,  nothing, [])
     right_leaf = Leaf(right_Δscore, right_is, nothing, [])
@@ -984,51 +1011,37 @@ end
 # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
 #
 # Its own method because it's faster that way.
-function build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
-  @inbounds for ii in 1:3:(length(leaf_is)-2)
+function build_histogram_unrolled(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+  @inbounds for ii in 1:2:(length(leaf_is)-1)
     i1 = leaf_is[ii]
     i2 = leaf_is[ii+1]
-    i3 = leaf_is[ii+2]
-    # i4 = leaf.is[ii+3]
+    # i3 = leaf_is[ii+2]
+    # i4 = leaf_is[ii+3]
   # for i in leaf.is # this version is almost twice as slow. Doesn't make sense.
     bin_i1 = feature_binned[i1]
     bin_i2 = feature_binned[i2]
-    bin_i3 = feature_binned[i3]
+    # bin_i3 = feature_binned[i3]
     # bin_i4 = feature_binned[i4]
 
-    data_point_weight1 = weights[i1]
-    data_point_weight2 = weights[i2]
-    data_point_weight3 = weights[i3]
-    # data_point_weight4 = weights[i4]
-
-    ∇loss1  = ∇logloss(y[i1], ŷ[i1]) * data_point_weight1
-    ∇loss2  = ∇logloss(y[i2], ŷ[i2]) * data_point_weight2
-    ∇loss3  = ∇logloss(y[i3], ŷ[i3]) * data_point_weight3
-    # ∇loss4  = ∇logloss(y[i4], ŷ[i4]) * data_point_weight4
-    ∇∇loss1 = ∇∇logloss(ŷ[i1])       * data_point_weight1
-    ∇∇loss2 = ∇∇logloss(ŷ[i2])       * data_point_weight2
-    ∇∇loss3 = ∇∇logloss(ŷ[i3])       * data_point_weight3
-    # ∇∇loss4 = ∇∇logloss(ŷ[i4])       * data_point_weight4
-
-    Σ∇losses[bin_i1]     += ∇loss1
-    Σ∇losses[bin_i2]     += ∇loss2
-    Σ∇losses[bin_i3]     += ∇loss3
-    # Σ∇losses[bin_i4]     += ∇loss4
-    Σ∇∇losses[bin_i1]    += ∇∇loss1
-    Σ∇∇losses[bin_i2]    += ∇∇loss2
-    Σ∇∇losses[bin_i3]    += ∇∇loss3
-    # Σ∇∇losses[bin_i4]    += ∇∇loss4
-    data_weights[bin_i1] += data_point_weight1
-    data_weights[bin_i2] += data_point_weight2
-    data_weights[bin_i3] += data_point_weight3
-    # data_weights[bin_i4] += data_point_weight4
+    Σ∇losses[bin_i1]     += ∇losses[i1]
+    Σ∇losses[bin_i2]     += ∇losses[i2]
+    # Σ∇losses[bin_i3]     += ∇losses[i3]
+    # Σ∇losses[bin_i4]     += ∇losses[i4]
+    Σ∇∇losses[bin_i1]    += ∇∇losses[i1]
+    Σ∇∇losses[bin_i2]    += ∇∇losses[i2]
+    # Σ∇∇losses[bin_i3]    += ∇∇losses[i3]
+    # Σ∇∇losses[bin_i4]    += ∇∇losses[i4]
+    data_weights[bin_i1] += weights[i1]
+    data_weights[bin_i2] += weights[i2]
+    # data_weights[bin_i3] += weights[i3]
+    # data_weights[bin_i4] += weights[i4]
   end
 
   ()
 end
 
 # Calculates and returns the histogram for feature_i over leaf_is
-function calculate_feature_histogram(X_binned :: Data, y, ŷ, weights, feature_i, leaf_is)
+function calculate_feature_histogram(X_binned :: Data, ∇losses, ∇∇losses, weights, feature_i, leaf_is)
 
   histogram = Histogram(max_bins)
 
@@ -1038,21 +1051,15 @@ function calculate_feature_histogram(X_binned :: Data, y, ŷ, weights, feature_i
   Σ∇∇losses    = histogram.Σ∇∇losses
   data_weights = histogram.data_weights
 
-  build_histogram_unrolled(feature_binned, weights, y, ŷ, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+  build_histogram_unrolled(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
 
   # The last couple points...
-  @inbounds for ii in ((1:3:(length(leaf_is)-2)).stop + 3):length(leaf_is)
+  @inbounds for ii in ((1:2:(length(leaf_is)-1)).stop + 2):length(leaf_is)
     i = leaf_is[ii]
     bin_i = feature_binned[i]
-
-    data_point_weight = weights[i]
-
-    ∇loss  = ∇logloss(y[i], ŷ[i]) * data_point_weight
-    ∇∇loss = ∇∇logloss(ŷ[i])      * data_point_weight
-
-    Σ∇losses[bin_i]     += ∇loss
-    Σ∇∇losses[bin_i]    += ∇∇loss
-    data_weights[bin_i] += data_point_weight
+    Σ∇losses[bin_i]     += ∇losses[i]
+    Σ∇∇losses[bin_i]    += ∇∇losses[i]
+    data_weights[bin_i] += weights[i]
   end
 
   histogram
