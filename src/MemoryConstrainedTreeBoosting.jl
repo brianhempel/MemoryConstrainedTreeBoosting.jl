@@ -36,6 +36,7 @@ function parallel_map!(f, out, in)
   out
 end
 
+# Fast, at the cost of up to 2x max memory usage compared to growing the arrays dynamically.
 function partition(f, in)
   trues   = Vector{eltype(in)}(undef, length(in))
   falses  = Vector{eltype(in)}(undef, length(in))
@@ -55,6 +56,47 @@ function partition(f, in)
 
   resize!(trues,  true_i-1)
   resize!(falses, false_i-1)
+
+  (trues, falses)
+end
+
+# Fast, at the cost of up to 3x max memory usage compared to growing the arrays dynamically non-parallel.
+#
+# Each thread partitions one chunk of the array.
+# Then, based on the size of the partition chunks,
+# each thread copies its chunk into an appropriate
+# position in the final array.
+function parallel_partition(f, in)
+  # Partition in chunks.
+  thread_trues, thread_falses = parallel_iterate(length(in)) do thread_range
+    partition(f, @view in[thread_range])
+  end
+
+  # Compute chunk locations in final list.
+  trues_end_indicies  = cumsum(map(length, thread_trues))
+  falses_end_indicies = cumsum(map(length, thread_falses))
+  trues_count  = last(trues_end_indicies)
+  falses_count = last(falses_end_indicies)
+
+  # @assert trues_count + falses_count == length(in)
+
+  trues   = Vector{eltype(in)}(undef, trues_count)
+  falses  = Vector{eltype(in)}(undef, falses_count)
+
+  # @assert Threads.nthreads() == length(thread_trues)
+  # @assert Threads.nthreads() == length(thread_falses)
+
+  Threads.@threads for thread_i in 1:Threads.nthreads()
+    trues_start_index  = 1 + (thread_i >= 2 ? trues_end_indicies[thread_i-1]  : 0)
+    falses_start_index = 1 + (thread_i >= 2 ? falses_end_indicies[thread_i-1] : 0)
+    trues_range  = trues_start_index:trues_end_indicies[thread_i]
+    falses_range = falses_start_index:falses_end_indicies[thread_i]
+    trues[trues_range]   = thread_trues[thread_i]
+    falses[falses_range] = thread_falses[thread_i]
+  end
+
+  # @assert trues  == filter(f, in)
+  # @assert falses == filter(x -> !f(x), in)
 
   (trues, falses)
 end
@@ -618,7 +660,7 @@ end
 function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
   if weights == nothing
-    weights = fill(one(DataWeight), length(y))
+    weights = ones(DataWeight, length(y))
   end
 
   if isempty(prior_trees)
@@ -866,7 +908,7 @@ function perhaps_split_tree(tree, X_binned :: Data, y, ŷ, weights, feature_is; 
 
     feature_binned = get_feature(X_binned, feature_i)
 
-    left_is, right_is = partition(i -> feature_binned[i] <= split_i, leaf_to_split.is)
+    left_is, right_is = parallel_partition(i -> feature_binned[i] <= split_i, leaf_to_split.is)
 
     left_ys       = @view y[left_is]
     left_ŷs       = @view ŷ[left_is]
@@ -1003,7 +1045,7 @@ end
 function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
   best_expected_Δloss, best_feature_i, best_split_i = (Loss(0.0), 0, UInt8(0))
 
-  # This should be fast enough that threading won't help, because it's only O(max_bins*feature_count).
+  # This is fast enough that threading won't help. It's only O(max_bins*feature_count).
 
   for feature_i in feature_is
     histogram = features_histograms[feature_i]
