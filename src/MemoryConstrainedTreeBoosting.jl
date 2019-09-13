@@ -981,18 +981,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
     # If root node, switch from unit range to our scratch memory/
     scratch_is = isa(leaf_to_split.is, UnitRange) ? is : leaf_to_split.is
 
-    left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, trues, falses, leaf_to_split.is)
-
-    left_∇losses   = @view ∇losses[left_is]
-    left_∇∇losses  = @view ∇∇losses[left_is]
-    right_∇losses  = @view ∇losses[right_is]
-    right_∇∇losses = @view ∇∇losses[right_is]
-
-    left_Δscore  = optimal_Δscore(left_∇losses,  left_∇∇losses,  l2_regularization, max_delta_score)
-    right_Δscore = optimal_Δscore(right_∇losses, right_∇∇losses, l2_regularization, max_delta_score)
-
-    left_leaf  = Leaf(left_Δscore,  left_is,  nothing, [])
-    right_leaf = Leaf(right_Δscore, right_is, nothing, [])
+    left_leaf, right_leaf = make_split_leaves(feature_binned, ∇losses, ∇∇losses, split_i, scratch_is, trues, falses, leaf_to_split.is, l2_regularization, max_delta_score)
 
     new_node = Node(feature_i, split_i, left_leaf, right_leaf, leaf_to_split.features_histograms)
 
@@ -1002,6 +991,23 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
   else
     (false, tree)
   end
+end
+
+function make_split_leaves(feature_binned, ∇losses, ∇∇losses, split_i, scratch_is, trues, falses, leaf_is, l2_regularization, max_delta_score)
+  left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, trues, falses, leaf_is)
+
+  left_∇losses   = @view ∇losses[left_is]
+  left_∇∇losses  = @view ∇∇losses[left_is]
+  right_∇losses  = @view ∇losses[right_is]
+  right_∇∇losses = @view ∇∇losses[right_is]
+
+  left_Δscore  = optimal_Δscore(left_∇losses,  left_∇∇losses,  l2_regularization, max_delta_score)
+  right_Δscore = optimal_Δscore(right_∇losses, right_∇∇losses, l2_regularization, max_delta_score)
+
+  left_leaf  = Leaf(left_Δscore,  left_is,  nothing, [])
+  right_leaf = Leaf(right_Δscore, right_is, nothing, [])
+
+  (left_leaf, right_leaf)
 end
 
 # If the parent cached its histogram, and the other sibling has already done its calculation, then we can calculate our histogram by simple subtraction.
