@@ -593,7 +593,7 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
     if isnothing(validation_scores)
       validation_scores = predict_on_binned(validation_X_binned, trees, output_raw_scores = true)
     else
-      validation_scores = predict_on_binned(validation_X_binned, [new_tree], starting_scores = validation_scores, output_raw_scores = true)
+      apply_tree!(validation_X_binned, new_tree, validation_scores)
     end
     validation_loss = compute_mean_logloss(validation_y, validation_scores, validation_weights)
 
