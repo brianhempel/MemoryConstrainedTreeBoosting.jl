@@ -207,6 +207,16 @@ mutable struct Leaf <: Tree
   Leaf(Δscore, is = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, maybe_split_candidate, features_histograms)
 end
 
+# For use in a list; right_i and left_i are indices into the list. feature_i == -1 for leaves.
+# Would love to generate a Julia-native function, but can't seem to dodge world conflicts. (And invokelatest is slow.)
+struct FastNode
+  feature_i :: Int64
+  split_i   :: Int64
+  left_i    :: Int64
+  right_i   :: Int64
+  Δscore    :: Score
+end
+
 function tree_to_dict(node :: Node) :: Dict{Symbol,Any}
   Dict(
     :type      => "Node",
@@ -421,30 +431,51 @@ end
 
 # Mutates scores.
 function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
+  # Would love to generate a function and use it, but can't seem to dodge world conflicts and invokelatest was slow.
+  fast_nodes = tree_to_fast_nodes(tree)
+
+  _apply_tree!(X_binned, fast_nodes, scores)
+end
+
+# Pre-order traversal, so index of subtree root is always the given node_i.
+function tree_to_fast_nodes(node :: Node, node_i = 1) :: Vector{FastNode}
+  left_i = node_i + 1
+  left_nodes  = tree_to_fast_nodes(node.left, left_i)
+  right_i = left_i + length(left_nodes)
+  right_nodes = tree_to_fast_nodes(node.right, right_i)
+
+  node = FastNode(node.feature_i, node.split_i, left_i, right_i, 0f0)
+  vcat([node], left_nodes, right_nodes)
+end
+
+function tree_to_fast_nodes(leaf :: Leaf, node_i = 1) :: Vector{FastNode}
+  [FastNode(-1, -1, -1, -1, leaf.Δscore)]
+end
+
+# Mutates scores.
+function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}) :: Vector{Score}
   Threads.@threads for i in 1:data_count(X_binned)
-  # for i in 1:data_count(X_binned)
-    # Multi-dispatch is faster and fewer allocations that trying to do this in a loop.
-    apply_tree_to_datapoint!(X_binned, i, tree, scores)
+    node_i = 1
+    @inbounds while true
+      node = fast_nodes[node_i]
+      if node.feature_i > 0
+        if X_binned[i, node.feature_i] <= node.split_i
+          node_i = node.left_i
+        else
+          node_i = node.right_i
+        end
+      else
+        scores[i] += node.Δscore
+        break
+      end
+    end
   end
   scores
 end
 
-# Mutates scores.
-function apply_tree_to_datapoint!(X_binned :: Data, i :: Int64, node :: Node, scores :: Vector{Score})
-  if X_binned[i, node.feature_i] <= node.split_i
-    apply_tree_to_datapoint!(X_binned, i, node.left, scores)
-  else
-    apply_tree_to_datapoint!(X_binned, i, node.right, scores)
-  end
-end
-
-# Mutates scores.
-function apply_tree_to_datapoint!(X_binned :: Data, i :: Int64, leaf :: Leaf, scores :: Vector{Score})
-  scores[i] += leaf.Δscore
-  ()
-end
-
-# Returns a function tree_func(X, scores) that runs the tree on unbinned data X and mutates scores
+# Returns a function tree_func(X, scores) that runs the tree on data X and mutates scores
+#
+# If bin_splits == nothing, assumes data is already binned
 function tree_to_function(bin_splits, tree)
   eval(quote
     (X, scores) -> begin
@@ -1057,13 +1088,13 @@ end
 # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
 #
 # Its own method because it's faster that way.
-function build_histogram_unrolled(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+function build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
   @inbounds for ii in 1:2:(length(leaf_is)-1)
     i1 = leaf_is[ii]
     i2 = leaf_is[ii+1]
     # i3 = leaf_is[ii+2]
     # i4 = leaf_is[ii+3]
-  # for i in leaf.is # this version is almost twice as slow. Doesn't make sense.
+
     bin_i1 = feature_binned[i1]
     bin_i2 = feature_binned[i2]
     # bin_i3 = feature_binned[i3]
@@ -1097,7 +1128,7 @@ function calculate_feature_histogram(X_binned :: Data, ∇losses, ∇∇losses, 
   Σ∇∇losses    = histogram.Σ∇∇losses
   data_weights = histogram.data_weights
 
-  build_histogram_unrolled(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+  build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
 
   # The last couple points...
   @inbounds for ii in ((1:2:(length(leaf_is)-1)).stop + 2):length(leaf_is)
@@ -1116,6 +1147,7 @@ function find_best_split(features_histograms, feature_is, min_data_weight_in_lea
   best_expected_Δloss, best_feature_i, best_split_i = (Loss(0.0), 0, UInt8(0))
 
   # This is fast enough that threading won't help. It's only O(max_bins*feature_count).
+  # And it's already ridiculously fast.
 
   for feature_i in feature_is
     histogram = features_histograms[feature_i]
