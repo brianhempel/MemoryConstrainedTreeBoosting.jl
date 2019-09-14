@@ -962,14 +962,6 @@ function leaf_expected_Δloss(Σ∇loss :: Loss, Σ∇∇loss :: Loss, l2_regula
   Σ∇loss * Δscore + 0.5f0 * Σ∇∇loss * Δscore * Δscore
 end
 
-function range_chunks(n, chunk_size)
-  chunks = UnitRange{Int64}[]
-  for start in 1:chunk_size:n
-    push!(chunks, start:min(start + chunk_size - 1, n))
-  end
-  chunks
-end
-
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
@@ -1003,16 +995,13 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
       feature_is_to_compute = filter(feature_i -> isnothing(leaf.features_histograms[feature_i]), feature_is)
 
-      per_thread_cache_lines    = zeros(Int64, (8, Threads.nthreads()))
-      thread_sync_points        = view(per_thread_cache_lines, 5, :)
-
       # Threads.@threads for feature_i in feature_is_to_compute
       parallel_iterate(length(feature_is_to_compute)) do thread_range
         for feature_i in @view feature_is_to_compute[thread_range]
           leaf.features_histograms[feature_i] =
-            calculate_feature_histogram(X_binned, ∇losses, ∇∇losses, weights, feature_i, leaf.is, thread_sync_points)
+            calculate_feature_histogram(X_binned, ∇losses, ∇∇losses, weights, feature_i, leaf.is)
         end
-        thread_sync_points[Threads.threadid()] = typemax(Int64)
+        ()
       end
 
       leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
@@ -1114,8 +1103,6 @@ function build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weig
 end
 
 function _build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
-  # thread_id = Threads.threadid()
-
   # Memory per datapoint = 4 (leaf_is) + 1  (featue_binned) + 4  (∇losses) + 4  (∇∇losses) +  4 (weights) =  17 bytes if dense
   # Memory per datapoint = 4 (leaf_is) + 64 (featue_binned) + 64 (∇losses) + 64 (∇∇losses) + 64 (weights) = 260 bytes if sparse (different cache lines)
   #
@@ -1147,28 +1134,13 @@ function _build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, wei
     data_weights[bin_i2] += weights[i2]
     # data_weights[bin_i3] += weights[i3]
     # data_weights[bin_i4] += weights[i4]
-
-    # thread_progresses[thread_id] += 2
   end
 
-  ()
-end
-
-function sync(thread_sync_points)
-  thread_id = Threads.threadid()
-  thread_sync_points[thread_id] += 1
-  my_point = thread_sync_points[thread_id]
-  for thread_i in 1:Threads.nthreads()
-    thread_i == thread_id && continue
-    while thread_sync_points[thread_i] < my_point
-      Libc.systemsleep(0.00001)
-    end
-  end
   ()
 end
 
 # Calculates and returns the histogram for feature_i over leaf_is
-function calculate_feature_histogram(X_binned :: Data, ∇losses, ∇∇losses, weights, feature_i, leaf_is, thread_sync_points)
+function calculate_feature_histogram(X_binned :: Data, ∇losses, ∇∇losses, weights, feature_i, leaf_is)
 
   histogram = Histogram(max_bins)
 
@@ -1178,21 +1150,7 @@ function calculate_feature_histogram(X_binned :: Data, ∇losses, ∇∇losses, 
   Σ∇∇losses    = histogram.Σ∇∇losses
   data_weights = histogram.data_weights
 
-  # # Synchronize start to see if we can get some L3 cache locality benefits for looking at the same peices of ∇losses, ∇∇losses, and weights
-  # my_features_completed = thread_features_completed[Threads.threadid()]
-  # while any(features_completed -> features_completed < my_features_completed, thread_features_completed)
-  # end
-
-  sync_interval = 100_000
-
-  for start in 1:sync_interval:length(leaf_is)
-    build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, view(leaf_is, start:min(start + sync_interval - 1, length(leaf_is))), Σ∇losses, Σ∇∇losses, data_weights)
-    sync(thread_sync_points)
-  end
-
-  # thread_race[Threads.threadid()] = thread_progresses[Threads.threadid()] - minimum(thread_progresses)
-
-  # thread_features_completed[Threads.threadid()] += 1
+  build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
 
   histogram
 end
