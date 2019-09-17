@@ -1145,7 +1145,7 @@ end
 function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, features_histograms, leaf_is)
 
   # Cache-optimal chunk sizes for root and others, chosen by search.
-  is_chunk_size = isa(leaf_is, UnitRange) ? 8688 : 464
+  is_chunk_size = isa(leaf_is, UnitRange) ? 8704 : 448
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
