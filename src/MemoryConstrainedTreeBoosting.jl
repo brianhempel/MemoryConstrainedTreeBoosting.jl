@@ -3,7 +3,6 @@ module MemoryConstrainedTreeBoosting
 export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, load_unbinned_predictor, make_callback_to_track_validation_loss
 
 import Random
-# using InteractiveUtils
 
 import BSON
 
@@ -1162,22 +1161,6 @@ function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature
     ()
   end
 end
-
-# # Calculates and returns the histogram for feature_i over leaf_is
-# function calculate_feature_histogram!(X_binned :: Data, ∇losses, ∇∇losses, weights, feature_i, leaf_is)
-#
-#   histogram =
-#
-#   feature_binned = get_feature(X_binned, feature_i)
-#
-#   Σ∇losses     = histogram.Σ∇losses
-#   Σ∇∇losses    = histogram.Σ∇∇losses
-#   data_weights = histogram.data_weights
-#
-#   build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
-#
-#   histogram
-# end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
