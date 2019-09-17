@@ -3,6 +3,7 @@ module MemoryConstrainedTreeBoosting
 export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, load_unbinned_predictor, make_callback_to_track_validation_loss
 
 import Random
+# using InteractiveUtils
 
 import BSON
 
@@ -996,13 +997,15 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
       feature_is_to_compute = filter(feature_i -> isnothing(leaf.features_histograms[feature_i]), feature_is)
 
       # Threads.@threads for feature_i in feature_is_to_compute
-      parallel_iterate(length(feature_is_to_compute)) do thread_range
-        for feature_i in @view feature_is_to_compute[thread_range]
-          leaf.features_histograms[feature_i] =
-            calculate_feature_histogram(X_binned, ∇losses, ∇∇losses, weights, feature_i, leaf.is)
-        end
-        ()
+
+      for feature_i in feature_is_to_compute
+        leaf.features_histograms[feature_i] = Histogram(max_bins)
       end
+
+      # println(@code_llvm compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, leaf.features_histograms, leaf.is))
+      # println()
+
+      compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, leaf.features_histograms, leaf.is)
 
       leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
     end # if leaf.maybe_split_candidate == nothing
@@ -1088,21 +1091,21 @@ function perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i,
 end
 
 # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
-function build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+function build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
 
-  _build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+  _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
 
   # The last couple points...
-  @inbounds for ii in ((1:2:(length(leaf_is)-1)).stop + 2):length(leaf_is)
+  @inbounds for ii in ((leaf_ii_start:2:(leaf_ii_stop-1)).stop + 2):leaf_ii_stop
     i = leaf_is[ii]
-    bin_i = feature_binned[i]
+    bin_i = X_binned[i, feature_i]
     Σ∇losses[bin_i]     += ∇losses[i]
     Σ∇∇losses[bin_i]    += ∇∇losses[i]
     data_weights[bin_i] += weights[i]
   end
 end
 
-function _build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+function _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
   # Memory per datapoint = 4 (leaf_is) + 1  (featue_binned) + 4  (∇losses) + 4  (∇∇losses) +  4 (weights) =  17 bytes if dense
   # Memory per datapoint = 4 (leaf_is) + 64 (featue_binned) + 64 (∇losses) + 64 (∇∇losses) + 64 (weights) = 260 bytes if sparse (different cache lines)
   #
@@ -1111,14 +1114,14 @@ function _build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, wei
   # Measured drift (MacOS, 4 cores) is 1 datapoint drift for every 6 datapoints, which means we want to
   # sync at most every 360,000 points (dense) or 24,000 points (sparse)
 
-  @inbounds for ii in 1:2:(length(leaf_is)-1)
+  @inbounds for ii in leaf_ii_start:2:(leaf_ii_stop-1)
     i1 = leaf_is[ii]
     i2 = leaf_is[ii+1]
     # i3 = leaf_is[ii+2]
     # i4 = leaf_is[ii+3]
 
-    bin_i1 = feature_binned[i1]
-    bin_i2 = feature_binned[i2]
+    bin_i1 = X_binned[i1, feature_i]
+    bin_i2 = X_binned[i2, feature_i]
     # bin_i3 = feature_binned[i3]
     # bin_i4 = feature_binned[i4]
 
@@ -1139,21 +1142,42 @@ function _build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, wei
   ()
 end
 
-# Calculates and returns the histogram for feature_i over leaf_is
-function calculate_feature_histogram(X_binned :: Data, ∇losses, ∇∇losses, weights, feature_i, leaf_is)
+function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, features_histograms, leaf_is)
 
-  histogram = Histogram(max_bins)
+  # Cache-optimal chunk sizes for root and others, chosen by search.
+  is_chunk_size = isa(leaf_is, UnitRange) ? 8688 : 464
 
-  feature_binned = get_feature(X_binned, feature_i)
+  # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned
+  # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
+  parallel_iterate(length(feature_is_to_compute)) do thread_range
+    for ii in 1:is_chunk_size:length(leaf_is)
+      for feature_i in @view feature_is_to_compute[thread_range]
+        Σ∇losses     = features_histograms[feature_i].Σ∇losses
+        Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
+        data_weights = features_histograms[feature_i].data_weights
 
-  Σ∇losses     = histogram.Σ∇losses
-  Σ∇∇losses    = histogram.Σ∇∇losses
-  data_weights = histogram.data_weights
-
-  build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
-
-  histogram
+        build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), Σ∇losses, Σ∇∇losses, data_weights)
+      end
+    end
+    ()
+  end
 end
+
+# # Calculates and returns the histogram for feature_i over leaf_is
+# function calculate_feature_histogram!(X_binned :: Data, ∇losses, ∇∇losses, weights, feature_i, leaf_is)
+#
+#   histogram =
+#
+#   feature_binned = get_feature(X_binned, feature_i)
+#
+#   Σ∇losses     = histogram.Σ∇losses
+#   Σ∇∇losses    = histogram.Σ∇∇losses
+#   data_weights = histogram.data_weights
+#
+#   build_histogram_unrolled!(feature_binned, ∇losses, ∇∇losses, weights, leaf_is, Σ∇losses, Σ∇∇losses, data_weights)
+#
+#   histogram
+# end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
