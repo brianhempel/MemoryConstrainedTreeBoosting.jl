@@ -1143,23 +1143,33 @@ end
 
 function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, features_histograms, leaf_is)
 
+  # For SREF, up to 27.7mb of leaf_is, and always 57.6mb of ∇losses,∇∇losses,weights
+
   # Cache-optimal chunk sizes for root and others, chosen by search.
   is_chunk_size = isa(leaf_is, UnitRange) ? 8704 : 448
+  features_chunk_size = 32*Threads.nthreads()
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
-  parallel_iterate(length(feature_is_to_compute)) do thread_range
-    for ii in 1:is_chunk_size:length(leaf_is)
-      for feature_i in @view feature_is_to_compute[thread_range]
-        Σ∇losses     = features_histograms[feature_i].Σ∇losses
-        Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
-        data_weights = features_histograms[feature_i].data_weights
+  for chunk_feature_ii in 1:features_chunk_size:length(feature_is_to_compute)
+    chunk_feature_is_to_compute = view(feature_is_to_compute, chunk_feature_ii:min(chunk_feature_ii+features_chunk_size-1, length(feature_is_to_compute)))
 
-        build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), Σ∇losses, Σ∇∇losses, data_weights)
+    parallel_iterate(length(chunk_feature_is_to_compute)) do thread_range
+      for ii in 1:is_chunk_size:length(leaf_is)
+        for feature_ii in thread_range
+          feature_i      = chunk_feature_is_to_compute[feature_ii]
+
+          Σ∇losses     = features_histograms[feature_i].Σ∇losses
+          Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
+          data_weights = features_histograms[feature_i].data_weights
+
+          build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), Σ∇losses, Σ∇∇losses, data_weights)
+        end
       end
+      ()
     end
-    ()
   end
+
 end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)

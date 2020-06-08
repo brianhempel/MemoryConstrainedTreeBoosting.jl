@@ -7,18 +7,19 @@ using Profile
 
 Random.seed!(123456)
 
-# For SREF, datapoint/feature ratio is ~20000:1
-feature_count = 320
-point_count   = feature_count*20_000
+# For SREF, datapoint/feature ratio is ~370:1
+feature_count = 5000
+point_count   = feature_count*200
 
-X       = randn(Float32, (point_count, feature_count))
+# X       = randn(Float32, (point_count, feature_count))
 y       = round.(rand(MemoryConstrainedTreeBoosting.Prediction, point_count))
 weights = rand(MemoryConstrainedTreeBoosting.DataWeight, point_count)
 
 
-bin_splits = prepare_bin_splits(X)
-X_binned   = apply_bins(X, bin_splits)
-X          = nothing
+# bin_splits = prepare_bin_splits(X)
+# X_binned   = apply_bins(X, bin_splits)
+X_binned   = rand(UInt8(1):UInt8(255), (point_count, feature_count))
+# X          = nothing
 
 validation_range = 1:div(point_count,3)
 
