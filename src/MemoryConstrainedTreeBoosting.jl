@@ -188,6 +188,13 @@ mutable struct Histogram
   data_weights :: Vector{DataWeight}
 
   Histogram(bin_count) = new(zeros(Loss, bin_count), zeros(Loss, bin_count), zeros(DataWeight, bin_count))
+
+  Histogram(parent_histogram :: Histogram, sibling_histogram :: Histogram) =
+    new(
+      parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses,
+      parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses,
+      parent_histogram.data_weights .- sibling_histogram.data_weights
+    )
 end
 
 mutable struct Node <: Tree
@@ -989,7 +996,8 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
       end
 
       # Don't really need threads on this one but it doesn't hurt.
-      Threads.@threads for feature_i in feature_is
+      # This accounts for most of the allocations.
+      for feature_i in feature_is
         perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i, tree, leaf)
       end
 
@@ -997,6 +1005,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
       # Threads.@threads for feature_i in feature_is_to_compute
 
+      # Okay this accounts for 1/3 of our allocations
       for feature_i in feature_is_to_compute
         leaf.features_histograms[feature_i] = Histogram(max_bins)
       end
@@ -1075,13 +1084,7 @@ function perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i,
       sibling_histogram = sibling.features_histograms[feature_i]
 
       if !isnothing(parent_histogram) && !isnothing(sibling_histogram)
-        histogram = Histogram(max_bins)
-
-        histogram.Σ∇losses     .= parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses
-        histogram.Σ∇∇losses    .= parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses
-        histogram.data_weights .= parent_histogram.data_weights .- sibling_histogram.data_weights
-
-        leaf.features_histograms[feature_i] = histogram
+        leaf.features_histograms[feature_i] = Histogram(parent_histogram, sibling_histogram)
       end
     end
   end
