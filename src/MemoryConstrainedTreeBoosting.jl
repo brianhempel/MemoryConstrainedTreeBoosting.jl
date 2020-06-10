@@ -996,16 +996,12 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
       end
 
       # Don't really need threads on this one but it doesn't hurt.
-      # This accounts for most of the allocations.
-      for feature_i in feature_is
+      Threads.@threads for feature_i in feature_is
         perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i, tree, leaf)
       end
 
       feature_is_to_compute = filter(feature_i -> isnothing(leaf.features_histograms[feature_i]), feature_is)
 
-      # Threads.@threads for feature_i in feature_is_to_compute
-
-      # Okay this accounts for 1/3 of our allocations
       for feature_i in feature_is_to_compute
         leaf.features_histograms[feature_i] = Histogram(max_bins)
       end
