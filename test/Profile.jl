@@ -30,7 +30,7 @@ iteration_callback =
       validation_weights = weights[validation_range]
     )
 
-trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.8, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
 # trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 100, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5)
 #
 # save_path = tempname()
@@ -60,8 +60,8 @@ trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, fea
 # ProfileView.view()
 # read(stdin,UInt8)
 
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
