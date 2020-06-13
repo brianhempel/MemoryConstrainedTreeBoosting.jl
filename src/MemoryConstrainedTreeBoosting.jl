@@ -188,13 +188,6 @@ mutable struct Histogram
   data_weights :: Vector{DataWeight}
 
   Histogram(bin_count) = new(zeros(Loss, bin_count), zeros(Loss, bin_count), zeros(DataWeight, bin_count))
-
-  Histogram(parent_histogram :: Histogram, sibling_histogram :: Histogram) =
-    new(
-      parent_histogram.Σ∇losses     .- sibling_histogram.Σ∇losses,
-      parent_histogram.Σ∇∇losses    .- sibling_histogram.Σ∇∇losses,
-      parent_histogram.data_weights .- sibling_histogram.data_weights
-    )
 end
 
 mutable struct Node <: Tree
@@ -1002,7 +995,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
       feature_is_to_compute = filter(feature_i -> isnothing(leaf.features_histograms[feature_i]), feature_is)
 
-      for feature_i in feature_is_to_compute
+      Threads.@threads for feature_i in feature_is_to_compute
         leaf.features_histograms[feature_i] = Histogram(max_bins)
       end
 
@@ -1063,6 +1056,14 @@ function make_split_leaves(feature_binned, ∇losses, ∇∇losses, split_i, scr
   (left_leaf, right_leaf)
 end
 
+# Returns the parent_histogram mutated into the second sibling
+function convert_parent_to_second_sibling_histogram!(parent_histogram, sibling_histogram)
+  parent_histogram.Σ∇losses     .-= sibling_histogram.Σ∇losses
+  parent_histogram.Σ∇∇losses    .-= sibling_histogram.Σ∇∇losses
+  parent_histogram.data_weights .-= sibling_histogram.data_weights
+  parent_histogram
+end
+
 # If the parent cached its histogram, and the other sibling has already done its calculation, then we can calculate our histogram by simple subtraction.
 #
 # Possibly mutates leaf.feature_histograms[feature_i]
@@ -1080,7 +1081,8 @@ function perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i,
       sibling_histogram = sibling.features_histograms[feature_i]
 
       if !isnothing(parent_histogram) && !isnothing(sibling_histogram)
-        leaf.features_histograms[feature_i] = Histogram(parent_histogram, sibling_histogram)
+        leaf.features_histograms[feature_i] = convert_parent_to_second_sibling_histogram!(parent_histogram, sibling_histogram)
+        parent.features_histograms[feature_i] = nothing
       end
     end
   end
