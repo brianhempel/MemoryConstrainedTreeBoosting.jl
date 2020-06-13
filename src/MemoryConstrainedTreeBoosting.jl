@@ -1175,28 +1175,37 @@ end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
 function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
-  best_expected_Δloss, best_feature_i, best_split_i = (Loss(0.0), 0, UInt8(0))
 
-  # This is fast enough that threading won't help. It's only O(max_bins*feature_count).
-  # And it's already ridiculously fast.
+  thread_best_expected_Δlosses, thread_best_feature_is, thread_best_split_is =
+    parallel_iterate(length(feature_is)) do thread_range
+      best_expected_Δloss, best_feature_i, best_split_i = (Loss(0.0), 0, UInt8(0))
 
-  for feature_i in feature_is
-    histogram = features_histograms[feature_i]
+      for feature_i in view(feature_is, thread_range)
+        histogram = features_histograms[feature_i]
 
-    if isnothing(histogram)
-      continue
+        if isnothing(histogram)
+          continue
+        end
+
+        expected_Δloss, split_i = best_split_for_feature(histogram, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+
+        if expected_Δloss < best_expected_Δloss
+          best_expected_Δloss = expected_Δloss
+          best_feature_i      = feature_i
+          best_split_i        = split_i
+        end
+      end # for feature_i in feature_is
+
+      (best_expected_Δloss, best_feature_i, best_split_i)
     end
 
-    expected_Δloss, split_i = best_split_for_feature(histogram, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+  (_, best_thread_i) = findmin(thread_best_expected_Δlosses)
 
-    if expected_Δloss < best_expected_Δloss
-      best_expected_Δloss = expected_Δloss
-      best_feature_i      = feature_i
-      best_split_i        = split_i
-    end
-  end # for feature_i in feature_is
-
-  SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
+  SplitCandidate(
+    thread_best_expected_Δlosses[best_thread_i],
+    thread_best_feature_is[best_thread_i],
+    thread_best_split_is[best_thread_i]
+  )
 end
 
 # Returns (expected_Δloss, best_split_i)
