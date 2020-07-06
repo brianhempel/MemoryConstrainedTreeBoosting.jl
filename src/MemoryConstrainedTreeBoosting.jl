@@ -1245,6 +1245,29 @@ function build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses,
   end
 end
 
+# # rw:        0 = read, 1 = write
+# # locality:  0 = none, 1 = L3, 2 = L2, 3 = L1
+# # cachetype: 0 = instruction, 1 = data
+# # Adapted from Yingbo Ma https://github.com/JuliaBLAS/JuliaBLAS.jl/blob/master/src/lowlevel.jl
+# @inline function _prefetch(address::Ptr{T}, rw::Integer, locality::Integer, cachetype::Integer) where T
+#   Base.llvmcall((""" declare void @llvm.prefetch(i8*, i32, i32, i32) """,
+#                  """
+#                  %ptr = inttoptr i64 %0 to i8*
+#                  call void @llvm.prefetch(i8* %ptr, i32 %1, i32 %2, i32 %3)
+#                  ret void
+#                  """),
+#                 Cvoid, Tuple{UInt64, Int32, Int32, Int32},
+#                 UInt64(address), Int32(rw), Int32(locality), Int32(cachetype))
+# end
+#
+# # Prefetch to L3 for reading
+# # On Intel, should produce prefetcht2 instruction
+# @inline prefetch_L3_r(view) = _prefetch(pointer(view), 0, 1, 1)
+#
+# # Prefetch to L3 for writing
+# # On Intel, should produce prefetcht2 instruction
+# @inline prefetch_L3_w(view) = _prefetch(pointer(view), 1, 1, 1)
+
 function _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
   # Memory per datapoint = 4 (leaf_is) + 1  (featue_binned) + 4  (∇losses) + 4  (∇∇losses) +  4 (weights) =  17 bytes if dense
   # Memory per datapoint = 4 (leaf_is) + 64 (featue_binned) + 64 (∇losses) + 64 (∇∇losses) + 64 (weights) = 260 bytes if sparse (different cache lines)
