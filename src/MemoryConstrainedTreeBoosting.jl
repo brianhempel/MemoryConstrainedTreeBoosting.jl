@@ -32,13 +32,6 @@ function parallel_map!(f, out, in)
   out
 end
 
-function parallel_sum(array)
-  thread_Σs = parallel_iterate(length(array)) do thread_range
-    sum(@view array[thread_range])
-  end
-  sum(thread_Σs)
-end
-
 # Provide pre-allocated trues and falses arrays.
 #
 # Fast, at the cost of up to 2x max memory usage compared to growing the arrays dynamically.
