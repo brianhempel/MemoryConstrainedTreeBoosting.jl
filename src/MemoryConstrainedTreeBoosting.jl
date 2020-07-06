@@ -141,6 +141,7 @@ default_config = (
   learning_rate                      = 0.1,
   feature_fraction                   = 1.0, # Per tree.
   bagging_temperature                = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
+  relearn_iterations                 = 0, # Relearn internal nodes after building a tree
   feature_i_to_name                  = nothing,
   iteration_callback                 = nothing, # Callback is given trees. If you want to override the default early stopping validation callback.
   validation_X                       = nothing,
@@ -195,6 +196,15 @@ mutable struct Histogram
   data_weights :: Vector{DataWeight}
 
   Histogram(bin_count) = new(zeros(Loss, bin_count), zeros(Loss, bin_count), zeros(DataWeight, bin_count))
+end
+
+# For relearning internal node splits.
+# Need to keep track of the amount of data in each leaf to honor min_data_weight_in_leaf.
+struct RelearningHistogram
+  left_instead_of_right_Δlosses              :: Vector{Loss}
+  left_instead_of_right_leaves_Δdata_weights :: Vector{Vector{Loss}}
+
+  RelearningHistogram(bin_count, leaf_count) = new(zeros(Loss, bin_count), map(_ -> zeros(Loss, bin_count), 1:leaf_count))
 end
 
 mutable struct Node <: Tree
@@ -815,8 +825,20 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses, ∇∇losses, weights)
 
-  tree = build_one_tree(X_binned, ∇losses, ∇∇losses, weights, is, trues, falses; config...)
-  tree = scale_leaf_Δscores(tree, learning_rate)
+
+  features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+
+  # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
+  feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
+
+  tree    = build_one_tree(X_binned, ∇losses, ∇∇losses, weights, is, feature_is, trues, falses; config...)
+  tree    = scale_leaf_Δscores(tree, learning_rate)
+  for _ in 1:get_config_field(config, :relearn_iterations)
+    tree, tree_changed = relearn_internal_nodes(tree, X_binned, y, scores, weights, is, UnitRange{index_type(y)}(1:length(y)), feature_is, trues, falses; config...)
+    if !tree_changed
+      break
+    end
+  end
   tree
 end
 
@@ -853,7 +875,7 @@ function bagged_weights(weights, bagging_temperature, weights_scratch = nothing)
   out
 end
 
-function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights, is, trues, falses; config...)
+function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights, is, feature_is, trues, falses; config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(weights)}(1:length(weights))
   tree =
@@ -863,11 +885,6 @@ function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights, is, 
       nothing, # maybe_split_candidate
       []       # feature_histograms
     )
-
-  features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
-
-  # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
-  feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
 
   tree_changed = true
 
@@ -1263,6 +1280,251 @@ function best_split_for_feature(histogram, min_data_weight_in_leaf, l2_regulariz
   end # for bin_i in 1:(max_bins-1)
 
   (best_expected_Δloss, best_split_i)
+end
+
+# function compute_Δlosses(X_binned :: Data, tree :: Tree, y, scores :: Vector{Score}, weights; score_transformer = identity)
+#
+#   fast_nodes = tree_to_fast_nodes(tree)
+#
+#   # Broadcast version, which performs allocations:
+#   # ŷ = σ.(scores)
+#   # mean_logloss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
+#   thread_Σlosses, thread_Σweights = parallel_iterate(length(y)) do thread_range
+#     Σloss   = zero(Loss)
+#     Σweight = zero(DataWeight)
+#     @inbounds for i in thread_range
+#       ŷ_i      = σ(score_transformer(scores[i]))
+#       Σloss   += logloss(y[i], ŷ_i) * weights[i]
+#       Σweight += weights[i]
+#     end
+#     (Σloss, Σweight)
+#   end
+# end
+
+is_leaf(fast_node :: FastNode) = fast_node.feature_i <= 0
+
+# Mutates data_leaf_is
+function data_to_terminal_leaf_i(X_binned :: Data, fast_nodes :: Vector{FastNode}, is; node_i)
+  data_leaf_is = Vector{UInt8}(undef, length(is))
+
+  # Abusing split_i field to store leaf index
+  leaf_i(fast_node) = is_leaf(fast_node) ? fast_node.split_i : error("leaf_i(fast_node) should only be called on a leaf FastNode")
+
+  Threads.@threads for ii in 1:length(is)
+    i = is[ii]
+
+    @inbounds while true
+      node = fast_nodes[node_i]
+      if node.feature_i > 0
+        if X_binned[i, node.feature_i] <= node.split_i
+          node_i = node.left_i
+        else
+          node_i = node.right_i
+        end
+      else
+        data_leaf_is[ii] = leaf_i(node)
+        break
+      end
+    end
+  end
+
+  data_leaf_is
+end
+
+
+function compute_left_right_terminal_leaves(X_binned, node :: Node, is)
+  leaf_i = 0
+  fast_nodes_list =
+    map(tree_to_fast_nodes(node)) do fast_node
+      if is_leaf(fast_node)
+        leaf_i += 1
+        # Abuse split_i field to store leaf index
+        FastNode(-1, leaf_i, -1, -1, fast_node.Δscore)
+      else
+        fast_node
+      end
+    end
+
+
+  data_leaves_left  = data_to_terminal_leaf_i(X_binned, fast_nodes_list, is; node_i = fast_nodes_list[1].left_i)
+  data_leaves_right = data_to_terminal_leaf_i(X_binned, fast_nodes_list, is; node_i = fast_nodes_list[1].right_i)
+
+  (data_leaves_left, data_leaves_right)
+end
+
+function compute_left_to_right_Δlosses(is, y, prior_scores, left_scores, right_scores, weights; score_transformer = identity)
+  data_left_instead_of_right_Δlosses = Vector{Loss}(undef, length(is))
+
+  thread_Δlosses_all_data_going_right = parallel_iterate(length(is)) do thread_range
+    thread_Δloss_all_data_going_right = Loss(0.0) # do we even need this?
+
+    @inbounds for ii in thread_range
+      i = is[ii]
+
+      prior_ŷ_i = σ(score_transformer(prior_scores[i]))
+      right_ŷ_i = σ(score_transformer(right_scores[i]))
+      left_ŷ_i  = σ(score_transformer(left_scores[i]))
+
+      prior_loss_i = logloss(y[i], prior_ŷ_i)
+      right_loss_i = logloss(y[i], right_ŷ_i)
+      left_loss_i  = logloss(y[i], left_ŷ_i)
+
+      data_left_instead_of_right_Δlosses[ii] = (left_loss_i - right_loss_i) * weights[i]
+
+      thread_Δloss_all_data_going_right += (prior_loss_i - right_loss_i) * weights[i]
+    end
+
+    thread_Δloss_all_data_going_right
+  end
+
+  Δloss_all_data_going_right = sum(thread_Δlosses_all_data_going_right)
+
+  ( Δloss_all_data_going_right
+  , data_left_instead_of_right_Δlosses
+  )
+end
+
+function compute_relearning_histogram!(X_binned, data_left_instead_of_right_Δlosses, data_leaves_left, data_leaves_right, weights, feature_i, relearning_histogram, is)
+  left_instead_of_right_Δlosses              = relearning_histogram.left_instead_of_right_Δlosses
+  left_instead_of_right_leaves_Δdata_weights = relearning_histogram.left_instead_of_right_leaves_Δdata_weights # array of arrays
+
+  for ii in 1:length(is)
+    i = is[ii]
+    bin_i = X_binned[i, feature_i]
+
+    left_instead_of_right_Δlosses[bin_i] += data_left_instead_of_right_Δlosses[ii]
+
+    left_instead_of_right_leaves_Δdata_weights[data_leaves_right[ii]][bin_i] -= weights[i]
+    left_instead_of_right_leaves_Δdata_weights[data_leaves_left[ii] ][bin_i] += weights[i]
+  end
+
+  ()
+end
+
+function relearn_internal_nodes(leaf :: Leaf, X_binned :: Data, y, prior_scores, weights, scratch_is, is, feature_is, trues, falses; config...)
+  (leaf, false)
+end
+
+function relearn_internal_nodes(node :: Node, X_binned :: Data, y, prior_scores, weights, scratch_is, is, feature_is, trues, falses; config...)
+  left_scores  = apply_tree!(X_binned, node.left,  copy(prior_scores))
+  right_scores = apply_tree!(X_binned, node.right, copy(prior_scores))
+
+  Δloss_all_data_going_right, data_left_instead_of_right_Δlosses = compute_left_to_right_Δlosses(is, y, prior_scores, left_scores, right_scores, weights)
+
+  data_leaves_left, data_leaves_right = compute_left_right_terminal_leaves(X_binned, node, is)
+
+  leaf_count = length(tree_leaves(node))
+
+  features_relearning_histograms =
+    Vector{Union{Nothing,RelearningHistogram}}(nothing, feature_count(X_binned))
+
+  Threads.@threads for feature_i in feature_is
+    relearning_histogram = RelearningHistogram(max_bins, leaf_count)
+
+    compute_relearning_histogram!(X_binned, data_left_instead_of_right_Δlosses, data_leaves_left, data_leaves_right, weights, feature_i, relearning_histogram, is)
+
+    features_relearning_histograms[feature_i] = relearning_histogram
+  end
+
+  leaf_data_weights_all_data_going_right = parallel_sum(@view weights[is])
+
+  min_data_weight_in_leaf = DataWeight(get_config_field(config, :min_data_weight_in_leaf))
+
+  _, best_feature_i, best_split_i =
+    relearn_best_split(features_relearning_histograms, feature_is, Δloss_all_data_going_right, leaf_data_weights_all_data_going_right, min_data_weight_in_leaf)
+
+  if best_feature_i == 0 # No improvement found
+    best_feature_i, best_split_i = (node.feature_i, node.split_i)
+  end
+
+  left_is, right_is = parallel_partition!(i -> X_binned[i, best_feature_i] <= best_split_i, scratch_is, trues, falses, is)
+
+  new_left,  left_changed  = relearn_internal_nodes(node.left,  X_binned, y, prior_scores, weights, left_is,  left_is,  feature_is, trues, falses; config...)
+  new_right, right_changed = relearn_internal_nodes(node.right, X_binned, y, prior_scores, weights, right_is, right_is, feature_is, trues, falses; config...)
+
+  node_changed =
+    best_feature_i != node.feature_i ||
+    best_split_i   != node.split_i
+
+  tree_changed =
+    node_changed  ||
+    left_changed  ||
+    right_changed
+
+  if tree_changed
+    if node_changed
+      println("Node changed from feature $(node.feature_i) to $best_feature_i and/or split $(node.split_i) to $best_split_i")
+    end
+    (Node(best_feature_i, best_split_i, new_left, new_right, []), true)
+  else
+    (node, false)
+  end
+end
+
+function relearn_best_split(features_relearning_histograms, feature_is, Δloss_all_data_going_right, leaf_data_weights_all_data_going_right, min_data_weight_in_leaf)
+  best_Δloss, best_feature_i, best_split_i = (Loss(0.0), 0, UInt8(0))
+
+  for feature_i in feature_is
+    relearning_histogram = features_relearning_histograms[feature_i]
+
+    if isnothing(relearning_histogram)
+      continue
+    end
+
+    Δloss, split_i = relearn_best_split_for_feature(relearning_histogram, Δloss_all_data_going_right, leaf_data_weights_all_data_going_right, min_data_weight_in_leaf)
+
+    if Δloss < best_Δloss
+      best_Δloss     = Δloss
+      best_feature_i = feature_i
+      best_split_i   = split_i
+    end
+  end # for feature_i in feature_is
+
+  (best_Δloss, best_feature_i, best_split_i)
+end
+
+function relearn_best_split_for_feature(relearning_histogram, Δloss_all_data_going_right, leaf_data_weights_all_data_going_right, min_data_weight_in_leaf)
+  best_Δloss, best_split_i = (Loss(0.0), UInt8(0))
+
+  left_instead_of_right_Δlosses              = relearning_histogram.left_instead_of_right_Δlosses
+  left_instead_of_right_leaves_Δdata_weights = relearning_histogram.left_instead_of_right_leaves_Δdata_weights # array of arrays
+
+  leaf_count = UInt8(length(left_instead_of_right_leaves_Δdata_weights))
+
+  ΣΔloss_if_data_goes_left_instead_of_right               = Loss(0.0)
+  leaves_ΣΔdata_weight_if_data_goes_left_instead_of_right = zeros(DataWeight, leaf_count)
+
+  @inbounds for bin_i in UInt8(1):UInt8(max_bins-1)
+    ΣΔloss_if_data_goes_left_instead_of_right += left_instead_of_right_Δlosses[bin_i]
+
+    all_leaves_have_enough_data = true
+
+    for leaf_i in UInt8(1):leaf_count
+      leaves_ΣΔdata_weight_if_data_goes_left_instead_of_right[leaf_i] +=
+        left_instead_of_right_leaves_Δdata_weights[leaf_i][bin_i]
+
+      weight_in_leaf =
+        leaf_data_weights_all_data_going_right[leaf_i] +
+        leaves_ΣΔdata_weight_if_data_goes_left_instead_of_right[leaf_i]
+
+      if weight_in_leaf < min_data_weight_in_leaf
+        all_leaves_have_enough_data = false
+      end
+    end
+
+    if !all_leaves_have_enough_data
+      continue
+    end
+
+    Δloss = Δloss_all_data_going_right + ΣΔloss_if_data_goes_left_instead_of_right
+
+    if Δloss < best_Δloss
+      best_Δloss   = Δloss
+      best_split_i = bin_i
+    end
+  end # for bin_i in 1:(max_bins-1)
+
+  (best_Δloss, best_split_i)
 end
 
 end # module MemoryConstrainedTreeBoosting
