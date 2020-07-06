@@ -103,12 +103,19 @@ iteration_callback() =
       max_iterations_without_improvement = 150
     )
 
-trees = train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.25, relearn_iterations = 1, iteration_callback = iteration_callback())
+train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.25, iteration_callback = iteration_callback())
 
-for relearn_iterations in 0:0
-  println("\n$relearn_iterations relearn iterations")
-  for _ in 1:5
-    train_on_binned(X_binned, y, iteration_count = 10_000, learning_rate = 0.01, l2_regularization = 1.0, feature_fraction = 0.4, min_data_weight_in_leaf = 2.0, max_delta_score = 5.0, max_leaves = 120, max_depth = 8, bagging_temperature = 0.0, relearn_iterations = relearn_iterations, iteration_callback = iteration_callback())
-    println("")
-  end
-end
+@time train_on_binned(
+  X_binned, y,
+  iteration_count = 10_000,
+  learning_rate = 0.01,
+  l2_regularization = 1.0,
+  feature_fraction = 0.4,
+  min_data_weight_in_leaf = 2.0,
+  max_delta_score = 5.0,
+  max_leaves = 120,
+  max_depth = 8,
+  bagging_temperature = 0.0,
+  iteration_callback = iteration_callback()
+)
+println("")
