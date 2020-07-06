@@ -7,6 +7,8 @@ using Profile
 
 Random.seed!(123456)
 
+# See https://catboost.ai/#benchmark for comparison.
+
 function make_numeric(column)
   # If numeric, pass through. Map ? to 0
   map(column) do val
@@ -111,7 +113,7 @@ train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_le
   learning_rate = 0.01,
   l2_regularization = 1.0,
   feature_fraction = 0.4,
-  min_data_weight_in_leaf = 2.0,
+  min_data_weight_in_leaf = 3.0,
   max_delta_score = 5.0,
   max_leaves = 120,
   max_depth = 8,
