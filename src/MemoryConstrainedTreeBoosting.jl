@@ -624,6 +624,7 @@ end
 struct EarlyStop <: Exception
 end
 
+# Note the returned closure is stateful (need to remake the iteration callback for new runs).
 function make_callback_to_track_validation_loss(validation_X_binned, validation_y; validation_weights = nothing, max_iterations_without_improvement = typemax(Int64))
   validation_scores              = nothing
   best_loss                      = Loss(Inf)
@@ -642,7 +643,6 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
     end
     validation_loss = compute_mean_logloss(validation_y, validation_scores, validation_weights)
 
-    print("\rValidation loss: $validation_loss    ")
     if validation_loss < best_loss
       best_loss                      = validation_loss
       iterations_without_improvement = 0
@@ -653,6 +653,7 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
         throw(EarlyStop())
       end
     end
+    print("\rBest validation loss: $best_loss    ")
 
     validation_loss
   end
