@@ -9,6 +9,11 @@ profile:
 	# julia --project=. test/Profile.jl
 	JULIA_NUM_THREADS=4 julia --project=. test/Profile.jl
 
+test_and_profile_calibration:
+	# May need to turn threads off in various functions
+	# julia --project=. test/Profile.jl
+	JULIA_NUM_THREADS=4 julia --project=. test/Calibration.jl
+
 evaluate:
 	# May need to turn threads off in various functions
 	julia --project=. test/Evaluation.jl

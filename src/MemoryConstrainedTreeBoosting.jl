@@ -924,12 +924,12 @@ function compute_mean_probability(y, weights)
   sum(thread_Σlabels) / sum(thread_Σweight)
 end
 
-function compute_mean_logloss(y, scores, weights = nothing)
+function compute_mean_logloss(y, scores, weights = nothing; score_transformer = identity)
   weights = isnothing(weights) ? Const(one(DataWeight)) : weights
-  _compute_mean_logloss(y, scores, weights)
+  _compute_mean_logloss(y, scores, weights; score_transformer = score_transformer)
 end
 
-function _compute_mean_logloss(y, scores, weights)
+function _compute_mean_logloss(y, scores, weights; score_transformer = identity)
   # Broadcast version, which performs allocations:
   # ŷ = σ.(scores)
   # mean_logloss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
@@ -937,7 +937,7 @@ function _compute_mean_logloss(y, scores, weights)
     Σloss   = zero(Loss)
     Σweight = zero(DataWeight)
     @inbounds for i in thread_range
-      ŷ_i      = σ(scores[i])
+      ŷ_i      = σ(score_transformer(scores[i]))
       Σloss   += logloss(y[i], ŷ_i) * weights[i]
       Σweight += weights[i]
     end
@@ -945,6 +945,121 @@ function _compute_mean_logloss(y, scores, weights)
   end
   sum(thread_Σlosses) / sum(thread_Σweights)
 end
+
+function compute_platt_scaling_score_transformer(y, scores, weights; a = 1f0, b = 0f0)
+  # thread_Σweights = parallel_iterate(length(y)) do thread_range
+  #   Σweight = zero(DataWeight)
+  #   @inbounds for i in thread_range
+  #     Σweight += weights[i]
+  #   end
+  #   Σweight
+  # end
+  # total_weight = sum(thread_Σweights)
+
+  total_weight = parallel_sum(weights)
+
+
+  for iteration_i = 1:20
+    thread_Σlosses, thread_Σdloss_vec, thread_Σloss_hessian = parallel_iterate(length(y)) do thread_range
+      Σloss_Σdloss_vec_Σloss_hessian(y, scores, weights, a, b, thread_range)
+    end
+    loss         = sum(thread_Σlosses)              / total_weight
+    dloss_vec    = reduce(+, thread_Σdloss_vec)    ./ total_weight
+    loss_hessian = reduce(+, thread_Σloss_hessian) ./ total_weight
+
+    step = inv(loss_hessian) * dloss_vec
+
+    a -= step[1]
+    b -= step[2]
+
+    # println("Loss before iteration $iteration_i:\t$loss")
+    # println((a,b))
+  end
+
+  println((a,b))
+  transformer = (score -> a*score + b)
+
+  # final_loss = compute_mean_logloss(y, scores, weights; score_transformer = transformer)
+  # println("Loss final:\t$final_loss")
+
+  transformer
+end
+
+function Σloss_Σdloss_vec_Σloss_hessian(y, scores, weights, a, b, thread_range)
+  Σloss         = zero(Loss)
+  Σdloss_vec    = Loss[0.0, 0.0]
+  Σloss_hessian = Loss[0.0 0.0; 0.0 0.0]
+  @inbounds for i in thread_range
+    y_i = y[i]
+    ŷ_i = σ(a*scores[i] + b)
+
+    Σloss += logloss(y_i, ŷ_i) * weights[i]
+
+    dloss  = ∇logloss(y_i, ŷ_i) * weights[i]
+    ddloss = ∇∇logloss(ŷ_i)     * weights[i]
+
+    Σdloss_vec[1] += dloss*scores[i] # da
+    Σdloss_vec[2] += dloss           # db
+
+    Σloss_hessian[1,1] += ddloss*scores[i]*scores[i]
+    Σloss_hessian[2,1] += ddloss*scores[i]
+    Σloss_hessian[1,2] += ddloss*scores[i]
+    Σloss_hessian[2,2] += ddloss
+  end
+  (Σloss, Σdloss_vec, Σloss_hessian)
+end
+
+
+# # Computing the precise min/max is too tricky to do *fast* (requires sorting all the scores).
+# # Didn't help.
+# function compute_min_max_score_transformer(y, scores, weights; prior_score_transformer = identity)
+#
+#   mins = Float32.(-88:0.5:16) # σ(-89f0) rounds to 0.0f0 but σ(-88f0) does not
+#   maxs = Float32.(-88:0.5:16) # σ(17f0)  rounds to 1.0f0 but σ(16f0)  does not
+#   iterations = 0
+#
+#   min_probs = σ.(mins)
+#   max_probs = σ.(maxs)
+#
+#   # println(min_probs)
+#   # println(max_probs)
+#
+#   thread_minlossΣs, thread_maxlossΣs = parallel_iterate(length(y)) do thread_range
+#     minlossΣs_maxlossΣs(y, scores, weights, min_probs, max_probs, prior_score_transformer, thread_range)
+#   end
+#   total_minlossΣs = reduce(+, thread_minlossΣs)
+#   total_maxlossΣs = reduce(+, thread_maxlossΣs)
+#
+#   # println(total_minlossΣs)
+#   # println(total_maxlossΣs)
+#
+#   (_, final_min_i) = findmin(total_minlossΣs)
+#   (_, final_max_i) = findmin(total_maxlossΣs)
+#
+#   score_min = mins[final_min_i]
+#   score_max = maxs[final_max_i]
+#
+#   println(((score_min,score_max),(σ(score_min),σ(score_max))))
+#   (score -> clamp(score, score_min, score_max))
+# end
+#
+# function minlossΣs_maxlossΣs(y, scores, weights, min_probs, max_probs, prior_score_transformer, thread_range)
+#   minlossΣs = zeros(Loss, length(min_probs))
+#   maxlossΣs = zeros(Loss, length(max_probs))
+#   @inbounds for i in thread_range
+#     y_i      = y[i]
+#     ŷ_i      = σ(prior_score_transformer(scores[i]))
+#     weight_i = weights[i]
+#     for min_i in 1:length(min_probs)
+#       minlossΣs[min_i] += logloss(y_i, max(ŷ_i, min_probs[min_i])) * weight_i
+#     end
+#     for max_i in 1:length(max_probs)
+#       maxlossΣs[max_i] += logloss(y_i, min(ŷ_i, max_probs[max_i])) * weight_i
+#     end
+#   end
+#   (minlossΣs, maxlossΣs)
+# end
+
 
 # Stores results in ∇losses, ∇∇losses
 function compute_∇losses_∇∇losses!(y, scores, ∇losses, ∇∇losses, weights)
