@@ -1,6 +1,9 @@
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
+import Random
 using MemoryConstrainedTreeBoosting
+
+Random.seed!(123456)
 
 # 10x3 array
 X = Float32[0.314421   0.622812  0.758382
