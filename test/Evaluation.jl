@@ -114,7 +114,6 @@ train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_le
   l2_regularization = 1.0,
   feature_fraction = 0.4,
   min_data_weight_in_leaf = 3.0,
-  min_gain_to_split = 0.0,
   max_delta_score = 5.0,
   max_leaves = 120,
   max_depth = 8,

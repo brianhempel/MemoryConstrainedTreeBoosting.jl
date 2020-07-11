@@ -131,7 +131,6 @@ default_config = (
   bin_count                          = 255,
   iteration_count                    = 100,
   min_data_weight_in_leaf            = 10.0,
-  min_gain_to_split                  = 0.0, # Estimated gain, before shrinkage.
   l2_regularization                  = 1.0,
   max_leaves                         = 32,
   max_depth                          = 6,
@@ -1053,7 +1052,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
   expected_Δloss :: Loss
 
-  if expected_Δloss < -Loss(get_config_field(config, :min_gain_to_split))
+  if expected_Δloss < 0.0f0
     # We have a usable split!
 
     leaf_to_split   = leaves[leaf_i_to_split]
