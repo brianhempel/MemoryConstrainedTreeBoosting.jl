@@ -101,14 +101,15 @@ validation_binned = apply_bins(validation_data, bin_splits)
 iteration_callback() =
   make_callback_to_track_validation_loss(
       validation_binned,
-      validation_labels;
+      validation_labels,
+      bin_splits;
       max_iterations_without_improvement = 150
     )
 
-train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.25, iteration_callback = iteration_callback())
+train_on_binned(X_binned, y, bin_splits, iteration_count = 2, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.25, min_data_to_regress_in_leaf = 5, iteration_callback = iteration_callback())
 
 @time train_on_binned(
-  X_binned, y,
+  X_binned, y, bin_splits,
   iteration_count = 10_000,
   learning_rate = 0.01,
   l2_regularization = 1.0,
@@ -118,6 +119,7 @@ train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_le
   max_leaves = 120,
   max_depth = 8,
   bagging_temperature = 0.0,
+  # min_data_to_regress_in_leaf = 1000,
   iteration_callback = iteration_callback()
 )
 println("")
