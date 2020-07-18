@@ -373,10 +373,10 @@ function parent_node(tree, target) :: Union{Node,Nothing}
     tree
   else
     parent_in_left = parent_node(tree.left, target)
-    if parent_in_left != nothing
-      parent_in_left
-    else
+    if isnothing(parent_in_left)
       parent_node(tree.right, target)
+    else
+      parent_in_left
     end
   end
 end
@@ -1122,8 +1122,11 @@ function build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses,
 
   _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
 
+  first_ii_unprocessed =
+    leaf_ii_start + 2*length(leaf_ii_start:2:(leaf_ii_stop-1))
+
   # The last couple points...
-  @inbounds for ii in ((leaf_ii_start:2:(leaf_ii_stop-1)).stop + 2):leaf_ii_stop
+  @inbounds for ii in first_ii_unprocessed:leaf_ii_stop
     i = leaf_is[ii]
     bin_i = X_binned[i, feature_i]
     Σ∇losses[bin_i]     += ∇losses[i]
