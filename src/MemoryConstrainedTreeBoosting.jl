@@ -1,9 +1,8 @@
 module MemoryConstrainedTreeBoosting
 
-export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, make_callback_to_track_validation_loss
+export train, train_on_binned, prepare_bin_splits, apply_bins, predict, predict_on_binned, save, load, load_unbinned_predictor, make_callback_to_track_validation_loss
 
 import Random
-import LinearAlgebra
 
 import BSON
 
@@ -132,14 +131,13 @@ default_config = (
   bin_count                          = 255,
   iteration_count                    = 100,
   min_data_weight_in_leaf            = 10.0,
-  l2_regularization                  = 1.0, # Does not apply to leaves with linear regressions b/c feature values are not normalized in any way
+  l2_regularization                  = 1.0,
   max_leaves                         = 32,
   max_depth                          = 6,
   max_delta_score                    = 1.0e10, # Before shrinkage.
   learning_rate                      = 0.03,
   feature_fraction                   = 1.0, # Per tree.
   bagging_temperature                = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
-  min_data_to_regress_in_leaf        = typemax(Int64), # After building the tree, fit a linear regression in each leaf
   feature_i_to_name                  = nothing,
   iteration_callback                 = nothing, # Callback is given trees. If you want to override the default early stopping validation callback.
   validation_X                       = nothing,
@@ -210,29 +208,22 @@ end
 
 mutable struct Leaf <: Tree
   Δscore                :: Score # Called "weight" in the literature
-  slope                 :: Score # for regression on feature_i... score += Δscore + x_{feature_i} * slope
-  min_Δscore            :: Score # avoid extremes for out-of-distribution data,
-  max_Δscore            :: Score # so actually score += clamp(Δscore + x_{feature_i} * slope, -min_Δscore, max_Δscore)
-  feature_i             :: Int64
   is                                                        # Transient. Needed during tree growing.
   maybe_data_weight     :: Union{DataWeight,Nothing}        # Transient. Needed during tree growing.
   maybe_split_candidate :: Union{SplitCandidate,Nothing}    # Transient. Needed during tree growing.
   features_histograms   :: Vector{Union{Histogram,Nothing}} # Transient. Used to speed up tree calculation.
 
-  Leaf(Δscore, slope = 0f0, min_Δscore = -Inf32, max_Δscore = Inf32, feature_i = -1, is = nothing, maybe_data_weight = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, slope, min_Δscore, max_Δscore, feature_i, is, maybe_data_weight, maybe_split_candidate, features_histograms)
+  Leaf(Δscore, is = nothing, maybe_data_weight = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, maybe_data_weight, maybe_split_candidate, features_histograms)
 end
 
 # For use in a list; right_i and left_i are indices into the list. feature_i == -1 for leaves.
 # Would love to generate a Julia-native function, but can't seem to dodge world conflicts. (And invokelatest is slow.)
 struct FastNode
-  feature_i  :: Int64
-  split_i    :: Int64
-  left_i     :: Int64
-  right_i    :: Int64
-  Δscore     :: Score
-  slope      :: Score
-  min_Δscore :: Score
-  max_Δscore :: Score
+  feature_i :: Int64
+  split_i   :: Int64
+  left_i    :: Int64
+  right_i   :: Int64
+  Δscore    :: Score
 end
 
 function tree_to_dict(node :: Node) :: Dict{Symbol,Any}
@@ -248,11 +239,7 @@ end
 function tree_to_dict(leaf :: Leaf) :: Dict{Symbol,Any}
   Dict(
     :type        => "Leaf",
-    :delta_score => leaf.Δscore,
-    :slope       => leaf.slope,
-    :min_Δscore  => leaf.min_Δscore,
-    :max_Δscore  => leaf.max_Δscore,
-    :feature_i   => leaf.feature_i
+    :delta_score => leaf.Δscore
   )
 end
 
@@ -260,7 +247,7 @@ function dict_to_tree(dict :: Dict{Symbol,Any}) :: Tree
   if dict[:type] == "Node"
     Node(dict[:feature_i], dict[:split_i], dict_to_tree(dict[:left]), dict_to_tree(dict[:right]), [])
   elseif dict[:type] == "Leaf"
-    Leaf(dict[:delta_score], dict[:slope], dict[:min_Δscore], dict[:max_Δscore], dict[:feature_i])
+    Leaf(dict[:delta_score])
   else
     error("Bad tree type $(dict[:type])!")
   end
@@ -293,43 +280,37 @@ function load(path)
   (Vector{BinSplits{FeatureType}}(bin_splits), Vector{Tree}(trees))
 end
 
-# # Returns a JIT-able function that takes in data and returns predictions.
-# function load_unbinned_predictor(path)
-#   bin_splits, trees = load(path)
-#
-#   tree_funcs = map(tree -> tree_to_function(bin_splits, tree), trees)
-#
-#   predict(X) = begin
-#     thread_scores = map(_ -> zeros(Score, data_count(X)), 1:Threads.nthreads())
-#
-#     Threads.@threads for tree_func in tree_funcs
-#       tree_func(X, thread_scores[Threads.threadid()])
-#     end
-#
-#     σ.(sum(thread_scores))
-#   end
-# end
+# Returns a JIT-able function that takes in data and returns predictions.
+function load_unbinned_predictor(path)
+  bin_splits, trees = load(path)
+
+  tree_funcs = map(tree -> tree_to_function(bin_splits, tree), trees)
+
+  predict(X) = begin
+    thread_scores = map(_ -> zeros(Score, data_count(X)), 1:Threads.nthreads())
+
+    Threads.@threads for tree_func in tree_funcs
+      tree_func(X, thread_scores[Threads.threadid()])
+    end
+
+    σ.(sum(thread_scores))
+  end
+end
 
 function print_tree(tree, level = 0; feature_i_to_name = nothing)
   indentation = repeat("    ", level)
-  feature_name =
-    if feature_i_to_name != nothing && tree.feature_i >= 1
-      feature_i_to_name(tree.feature_i)
-    else
-      "feature $(tree.feature_i)"
-    end
   if isa(tree, Node)
+    feature_name =
+      if feature_i_to_name != nothing
+        feature_i_to_name(tree.feature_i)
+      else
+        "feature $(tree.feature_i)"
+      end
     println(indentation * "$feature_name\tsplit at $(tree.split_i)")
     print_tree(tree.left,  level + 1, feature_i_to_name = feature_i_to_name)
     print_tree(tree.right, level + 1, feature_i_to_name = feature_i_to_name)
   else
-    slope_str =
-      if tree.feature_i >= 1
-        " ($(tree.min_Δscore)-$(tree.max_Δscore))\tslope $(tree.slope) on $feature_name"
-      else
-        ""
-      end
-    println(indentation * "Δscore $(tree.Δscore)$(slope_str)\t$(length(tree.is)) datapoints")
+    println(indentation * "Δscore $(tree.Δscore)\t$(length(tree.is)) datapoints")
   end
 end
 
@@ -449,34 +430,31 @@ function strip_tree_training_info(tree) :: Tree
     right = strip_tree_training_info(tree.right)
     Node(tree.feature_i, tree.split_i, left, right, [])
   else
-    Leaf(tree.Δscore, tree.slope, tree.min_Δscore, tree.max_Δscore, tree.feature_i, nothing, nothing, nothing, [])
+    Leaf(tree.Δscore, nothing, nothing, nothing, [])
   end
 end
 
 # Mutates and returns tree.
-function scale_leaf_Δscores!(tree, learning_rate) :: Tree
+function scale_leaf_Δscores(tree, learning_rate) :: Tree
   for leaf in tree_leaves(tree)
-    leaf.Δscore     *= learning_rate
-    leaf.slope      *= learning_rate
-    leaf.min_Δscore *= learning_rate
-    leaf.max_Δscore *= learning_rate
+    leaf.Δscore *= learning_rate
   end
   tree
 end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid).
-function apply_tree(X_binned :: Data, tree :: Tree, bin_splits) :: Vector{Score}
+function apply_tree(X_binned :: Data, tree :: Tree) :: Vector{Score}
   scores = zeros(Score, data_count(X_binned))
-  apply_tree!(X_binned, tree, scores, bin_splits)
+  apply_tree!(X_binned, tree, scores)
 end
 
 # Mutates scores.
-function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}, bin_splits) :: Vector{Score}
+function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   # Would love to generate a function and use it, but can't seem to dodge world conflicts and invokelatest was slow.
   fast_nodes = tree_to_fast_nodes(tree)
 
-  _apply_tree!(X_binned, fast_nodes, scores, bin_splits)
+  _apply_tree!(X_binned, fast_nodes, scores)
 end
 
 # Pre-order traversal, so index of subtree root is always the given node_i.
@@ -486,29 +464,26 @@ function tree_to_fast_nodes(node :: Node, node_i = 1) :: Vector{FastNode}
   right_i = left_i + length(left_nodes)
   right_nodes = tree_to_fast_nodes(node.right, right_i)
 
-  node = FastNode(node.feature_i, node.split_i, left_i, right_i, 0f0, 0f0, -Inf32, Inf32)
+  node = FastNode(node.feature_i, node.split_i, left_i, right_i, 0f0)
   vcat([node], left_nodes, right_nodes)
 end
 
 function tree_to_fast_nodes(leaf :: Leaf, node_i = 1) :: Vector{FastNode}
-  [FastNode(leaf.feature_i, -1, -1, -1, leaf.Δscore, leaf.slope, leaf.min_Δscore, leaf.max_Δscore)]
+  [FastNode(-1, -1, -1, -1, leaf.Δscore)]
 end
 
 # Mutates scores.
-function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}, bin_splits) :: Vector{Score}
+function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}) :: Vector{Score}
   Threads.@threads for i in 1:data_count(X_binned)
     node_i = 1
     @inbounds while true
       node = fast_nodes[node_i]
-      if node.split_i >= 1
+      if node.feature_i > 0
         if X_binned[i, node.feature_i] <= node.split_i
           node_i = node.left_i
         else
           node_i = node.right_i
         end
-      elseif node.feature_i >= 1
-        scores[i] += clamp(node.Δscore + node.slope * unbin(X_binned, bin_splits, node.feature_i, i), node.min_Δscore, node.max_Δscore)
-        break
       else
         scores[i] += node.Δscore
         break
@@ -518,52 +493,40 @@ function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :
   scores
 end
 
-@inline function unbin(X_binned :: Data, bin_splits, feature_i, i)
-  split_i = X_binned[i, feature_i] - 1
-  bin_splits[feature_i][max(1, split_i)]
+# Returns a function tree_func(X, scores) that runs the tree on data X and mutates scores
+#
+# If bin_splits == nothing, assumes data is already binned
+function tree_to_function(bin_splits, tree)
+  eval(quote
+    (X, scores) -> begin
+      for i in 1:data_count(X)
+        $(tree_to_exp(bin_splits, tree))
+      end
+    end
+  end)
 end
 
-# # Returns a function tree_func(X, scores) that runs the tree on data X and mutates scores
-# #
-# # If bin_splits == nothing, assumes data is already binned
-# function tree_to_function(bin_splits, tree)
-#   eval(quote
-#     (X, scores) -> begin
-#       for i in 1:data_count(X)
-#         $(tree_to_exp(bin_splits, tree))
-#       end
-#     end
-#   end)
-# end
-#
-# # If bin_splits == nothing, then assumes the data is already binned
-# function tree_to_exp(bin_splits, node :: Node)
-#   threshold = isnothing(bin_splits) ? node.split_i : bin_splits[node.feature_i][node.split_i]
-#   quote
-#     if X[i, $(node.feature_i)] <= $(threshold)
-#       $(tree_to_exp(bin_splits, node.left))
-#     else
-#       $(tree_to_exp(bin_splits, node.right))
-#     end
-#   end
-# end
-#
-# function tree_to_exp(bin_splits, leaf :: Leaf)
-#   if leaf.feature_i >= 1
-#     quote
-#       crash_because_we_should_disallow_non_binned_fast_trees
-#       scores[i] += $(leaf.Δscore)
-#     end
-#   else
-#     quote
-#       scores[i] += $(leaf.Δscore)
-#     end
-#   end
-# end
+# If bin_splits == nothing, then assumes the data is already binned
+function tree_to_exp(bin_splits, node :: Node)
+  threshold = isnothing(bin_splits) ? node.split_i : bin_splits[node.feature_i][node.split_i]
+  quote
+    if X[i, $(node.feature_i)] <= $(threshold)
+      $(tree_to_exp(bin_splits, node.left))
+    else
+      $(tree_to_exp(bin_splits, node.right))
+    end
+  end
+end
+
+function tree_to_exp(bin_splits, leaf :: Leaf)
+  quote
+    scores[i] += $(leaf.Δscore)
+  end
+end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
-function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}, bin_splits; starting_scores = nothing) :: Vector{Score}
+function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}
 
   # thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
   scores = zeros(Score, data_count(X_binned))
@@ -571,7 +534,7 @@ function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}, bin_splits; star
   # Threads.@threads for tree in trees
   for tree in trees
     # apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
-    apply_tree!(X_binned, tree, scores, bin_splits)
+    apply_tree!(X_binned, tree, scores)
   end
 
   # scores = sum(thread_scores)
@@ -588,12 +551,12 @@ end
 function predict(X, bin_splits, trees; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
   X_binned = apply_bins(X, bin_splits)
 
-  predict_on_binned(X_binned, trees, bin_splits, starting_scores = starting_scores, output_raw_scores = output_raw_scores)
+  predict_on_binned(X_binned, trees, starting_scores = starting_scores, output_raw_scores = output_raw_scores)
 end
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}, bin_splits; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
-  scores = apply_trees(X_binned, trees, bin_splits; starting_scores = starting_scores)
+function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
+  scores = apply_trees(X_binned, trees; starting_scores = starting_scores)
   if output_raw_scores
     scores
   else
@@ -636,7 +599,6 @@ function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count = 255) :: Vecto
 end
 
 
-# If many splits are the same value (because of, e.g., a one-hot feature) the data point is put into the highest possible bin.
 function apply_bins(X, bin_splits) :: Data
   X_binned = zeros(UInt8, size(X))
 
@@ -683,7 +645,7 @@ struct EarlyStop <: Exception
 end
 
 # Note the returned closure is stateful (need to remake the iteration callback for new runs).
-function make_callback_to_track_validation_loss(validation_X_binned, validation_y, bin_splits; validation_weights = nothing, max_iterations_without_improvement = typemax(Int64))
+function make_callback_to_track_validation_loss(validation_X_binned, validation_y; validation_weights = nothing, max_iterations_without_improvement = typemax(Int64))
   validation_scores              = nothing
   best_loss                      = Loss(Inf)
   iterations_without_improvement = 0
@@ -695,9 +657,9 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
     new_tree = last(trees)
 
     if isnothing(validation_scores)
-      validation_scores = predict_on_binned(validation_X_binned, trees, bin_splits, output_raw_scores = true)
+      validation_scores = predict_on_binned(validation_X_binned, trees, output_raw_scores = true)
     else
-      apply_tree!(validation_X_binned, new_tree, validation_scores, bin_splits)
+      apply_tree!(validation_X_binned, new_tree, validation_scores)
     end
     validation_loss = compute_mean_logloss(validation_y, validation_scores, validation_weights)
 
@@ -742,8 +704,7 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
 
         make_callback_to_track_validation_loss(
             validation_X_binned,
-            get_config_field(config, :validation_y),
-            bin_splits;
+            get_config_field(config, :validation_y);
             validation_weights = get_config_field(config, :validation_weights),
             max_iterations_without_improvement = get_config_field(config, :max_iterations_without_improvement)
           )
@@ -758,7 +719,7 @@ function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tre
       get_config_field(config, :iteration_callback)
     end
 
-  trees = train_on_binned(X_binned, y, bin_splits; prior_trees = prior_trees, config..., iteration_callback = iteration_callback)
+  trees = train_on_binned(X_binned, y; prior_trees = prior_trees, config..., iteration_callback = iteration_callback)
 
   (bin_splits, trees)
 end
@@ -774,12 +735,7 @@ mutable struct ScratchMemory
   trues    :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
   falses   :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
 
-  unbinned         :: Union{Nothing,Vector{Float32}}    # During linear regression
-  weights_gathered :: Union{Nothing,Vector{DataWeight}} # During linear regression
-  y_gathered       :: Union{Nothing,Vector{Prediction}} # During linear regression
-  scores_gathered  :: Union{Nothing,Vector{Score}}      # During linear regression
-
-  ScratchMemory(y; config...) =
+  ScratchMemory(y, config) =
     new(
       Vector{Loss}(undef, length(y)),
       Vector{Loss}(undef, length(y)),
@@ -787,14 +743,10 @@ mutable struct ScratchMemory
       Vector{index_type(y)}(undef, length(y)),
       Vector{index_type(y)}(undef, length(y)),
       Vector{index_type(y)}(undef, length(y)),
-      get_config_field(config, :min_data_to_regress_in_leaf) <= length(y) ? Vector{Float32}(undef, length(y))    : nothing,
-      get_config_field(config, :min_data_to_regress_in_leaf) <= length(y) ? Vector{DataWeight}(undef, length(y)) : nothing,
-      get_config_field(config, :min_data_to_regress_in_leaf) <= length(y) ? Vector{Prediction}(undef, length(y)) : nothing,
-      get_config_field(config, :min_data_to_regress_in_leaf) <= length(y) ? Vector{Score}(undef, length(y))      : nothing
     )
 end
 
-function train_on_binned(X_binned :: Data, y, bin_splits; prior_trees=Tree[], config...) :: Vector{Tree}
+function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
   if weights == nothing
     weights = ones(DataWeight, length(y))
@@ -809,18 +761,18 @@ function train_on_binned(X_binned :: Data, y, bin_splits; prior_trees=Tree[], co
     prior_trees = Tree[Leaf(initial_score)]
   end
 
-  scores = apply_trees(X_binned, prior_trees, bin_splits) # Linear scores, before sigmoid transform.
+  scores = apply_trees(X_binned, prior_trees) # Linear scores, before sigmoid transform.
 
   trees = copy(prior_trees)
 
-  scratch_memory = ScratchMemory(y; config...)
+  scratch_memory = ScratchMemory(y, config)
 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
       duration = @elapsed begin
-        tree = train_one_iteration(X_binned, y, bin_splits, weights, scores; scratch_memory = scratch_memory, config...)
+        tree = train_one_iteration(X_binned, y, weights, scores; scratch_memory = scratch_memory, config...)
         tree = strip_tree_training_info(tree) # For long boosting sessions, should save memory if we strip off the list of indices
-        apply_tree!(X_binned, tree, scores, bin_splits)
+        apply_tree!(X_binned, tree, scores)
 
         # iteration_loss = compute_mean_logloss(y, scores, weights)
         # println(ŷ)
@@ -855,7 +807,7 @@ end
 
 
 # Returns new tree
-function train_one_iteration(X_binned, y :: Vector{Prediction}, bin_splits, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, config...) :: Tree
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, config...) :: Tree
   learning_rate       = Score(get_config_field(config, :learning_rate))
   bagging_temperature = DataWeight(get_config_field(config, :bagging_temperature))
 
@@ -877,13 +829,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, bin_splits, weig
   compute_∇losses_∇∇losses!(y, scores, ∇losses, ∇∇losses, weights)
 
   tree = build_one_tree(X_binned, ∇losses, ∇∇losses, weights, is, trues, falses; config...)
-  if get_config_field(config, :min_data_to_regress_in_leaf) <= length(y)
-    # println()
-    # print_tree(tree)
-    tree = regress_in_leaves(tree, X_binned, y, bin_splits, scores, weights, scratch_memory, -1, Score(get_config_field(config, :max_delta_score)), get_config_field(config, :min_data_to_regress_in_leaf))
-    # print_tree(tree)
-  end
-  scale_leaf_Δscores!(tree, learning_rate)
+  tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
 
@@ -926,10 +872,6 @@ function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights, is, 
   tree =
     Leaf(
       sum_optimal_Δscore(∇losses, ∇∇losses, Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
-      0f0,     # slope
-      -Inf32,  # min_Δscore
-      Inf32,   # max_Δscore
-      -1,      # feature_i
       all_is,
       nothing, # maybe_data_weight
       nothing, # maybe_split_candidate
@@ -1126,8 +1068,10 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
     left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, trues, falses, leaf_to_split.is)
 
-    left_leaf  = Leaf(split_candidate.left_Δscore,  0f0, -Inf32, Inf32, -1, left_is,  split_candidate.left_data_weight,  nothing, [])
-    right_leaf = Leaf(split_candidate.right_Δscore, 0f0, -Inf32, Inf32, -1, right_is, split_candidate.right_data_weight, nothing, [])
+    left_leaf  = Leaf(split_candidate.left_Δscore,  left_is,  split_candidate.left_data_weight,  nothing, [])
+    right_leaf = Leaf(split_candidate.right_Δscore, right_is, split_candidate.right_data_weight, nothing, [])
+
+    # left_leaf, right_leaf = make_split_leaves(feature_binned, ∇losses, ∇∇losses, weights, leaf_to_split.maybe_data_weight, split_i, scratch_is, trues, falses, leaf_to_split.is, l2_regularization, max_delta_score)
 
     new_node = Node(feature_i, split_i, left_leaf, right_leaf, leaf_to_split.features_histograms)
 
@@ -1244,7 +1188,7 @@ function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature
     parallel_iterate(length(chunk_feature_is_to_compute)) do thread_range
       for ii in 1:is_chunk_size:length(leaf_is)
         for feature_ii in thread_range
-          feature_i    = chunk_feature_is_to_compute[feature_ii]
+          feature_i      = chunk_feature_is_to_compute[feature_ii]
 
           Σ∇losses     = features_histograms[feature_i].Σ∇losses
           Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
@@ -1354,182 +1298,4 @@ function best_split_for_feature!(scratch_split_candidate, histogram, min_data_we
   ()
 end
 
-function regress_in_leaves(node :: Node, X_binned, y, bin_splits, scores, weights, scratch_memory, feature_i, max_delta_score, min_data_to_regress_in_leaf)
-  new_left  = regress_in_leaves(node.left,  X_binned, y, bin_splits, scores, weights, scratch_memory, node.feature_i, max_delta_score, min_data_to_regress_in_leaf)
-  new_right = regress_in_leaves(node.right, X_binned, y, bin_splits, scores, weights, scratch_memory, node.feature_i, max_delta_score, min_data_to_regress_in_leaf)
-  Node(node.feature_i, node.split_i, new_left, new_right, node.features_histograms)
-end
-
-function regress_in_leaves(leaf :: Leaf, X_binned, y, bin_splits, scores, weights, scratch_memory, feature_i, max_delta_score, min_data_to_regress_in_leaf)
-  if leaf.Δscore >= max_delta_score || leaf.Δscore <= -max_delta_score || feature_i < 1
-    return leaf
-  end
-
-  if length(leaf.is) < min_data_to_regress_in_leaf
-    return leaf
-  end
-
-  unbinned         = isnothing(scratch_memory) ? Vector{eltype(bin_splits[1])}(undef, length(leaf.is)) : scratch_memory.unbinned
-  weights_gathered = isnothing(scratch_memory) ? Vector{DataWeight}(undef, length(leaf.is))            : scratch_memory.weights_gathered
-  y_gathered       = isnothing(scratch_memory) ? Vector{Prediction}(undef, length(leaf.is))            : scratch_memory.y_gathered
-  scores_gathered  = isnothing(scratch_memory) ? Vector{Score}(undef, length(leaf.is))                 : scratch_memory.scores_gathered
-
-  min_val, max_val = gather_leaf_data!(leaf.is, X_binned, y, weights, scores, bin_splits, feature_i, unbinned, weights_gathered, y_gathered, scores_gathered)
-
-  if min_val == max_val
-    return leaf
-  end
-
-  total_weight = leaf.maybe_data_weight
-
-  a = 0f0         # slope
-  b = leaf.Δscore # offset
-
-  converged = false
-
-  # println("0\t$a\t$b")
-
-  for iteration_i = 1:10
-    thread_Σdloss_vec, thread_Σloss_hessian = parallel_iterate(length(leaf.is)) do thread_range
-      Σdloss_vec_Σloss_hessian(unbinned, y_gathered, weights_gathered, scores_gathered, a, b, thread_range)
-    end
-    # loss         = sum(thread_Σlosses)              / total_weight
-    # println("Loss before iteration $iteration_i:\t$loss")
-
-    dloss_vec    = reduce(+, thread_Σdloss_vec)    ./ total_weight
-    loss_hessian = reduce(+, thread_Σloss_hessian) ./ total_weight
-    loss_hessian[1,1] += ε
-    loss_hessian[2,2] += ε
-
-    step =
-      try
-        try
-          inv(loss_hessian) * dloss_vec
-        catch exception
-          if isa(exception, LinearAlgebra.SingularException)
-            # Diagonalize.
-            loss_hessian[1,2] = 0f0
-            loss_hessian[2,1] = 0f0
-            inv(loss_hessian) * dloss_vec
-          else
-            rethrow()
-          end
-        end
-      catch exception
-        if isa(exception, LinearAlgebra.LAPACKException) # Hessian is all zeros.
-          break
-        else
-          rethrow()
-        end
-      end
-
-    a -= step[1]
-    b -= step[2]
-
-    # println("$iteration_i\t$a\t$b")
-
-    # Converged? (Are the endpoints of the line stationary?)
-    if abs(min_val*step[1] + step[2]) < 0.01 && abs(max_val*step[1] + step[2]) < 0.01
-      converged = true
-      break
-    end
-    # println((a,b))
-  end
-
-  if !converged
-    # println("No convergence.")
-    return leaf
-  end
-
-  # Respecting max_delta_score:
-  # 1. scale so mean absolute Δscore is no more than max_delta_score
-  # 2. after scaling, clamp to min and max Δscore on training (at most 2*max_delta_score) to avoid extremes for out-of-distribution data
-
-  mean_abs_Δscore = total_abs_Δscore(length(leaf.is), unbinned, weights_gathered, a, b) / total_weight
-
-  scale_factor = clamp(mean_abs_Δscore, -max_delta_score, max_delta_score) / mean_abs_Δscore
-
-  a *= scale_factor
-  b *= scale_factor
-
-  min_Δscore, max_Δscore =
-    clamp.(sort([a*min_val+b, a*max_val+b]), -max_delta_score*2, max_delta_score*2)
-
-  Leaf(b, a, min_Δscore, max_Δscore, feature_i, leaf.is, leaf.maybe_data_weight, leaf.maybe_split_candidate, leaf.features_histograms)
-end
-
-# Separate method for speed/allocations
-# Mutates unbinned, weights_gathered, y_gathered, scores_gathered
-# Returns min_val, max_val
-function gather_leaf_data!(leaf_is, X_binned, y, weights, scores, bin_splits, feature_i, unbinned, weights_gathered, y_gathered, scores_gathered)
-  thread_mins, thread_maxs = parallel_iterate(length(leaf_is)) do thread_range
-    thread_min = Inf32
-    thread_max = -Inf32
-
-    @inbounds for ii in thread_range
-      i = leaf_is[ii]
-      feature_val = unbin(X_binned, bin_splits, feature_i, i)
-
-      unbinned[ii]         = feature_val
-      weights_gathered[ii] = weights[i]
-      y_gathered[ii]       = y[i]
-      scores_gathered[ii]  = scores[i]
-
-      if feature_val < thread_min
-        thread_min = feature_val
-      end
-      if feature_val > thread_max
-        thread_max = feature_val
-      end
-    end
-
-    (thread_min, thread_max)
-  end
-
-  ( minimum(thread_mins)
-  , maximum(thread_maxs)
-  )
-end
-
-# Separate method for speed/allocations
-function total_abs_Δscore(data_count, unbinned, weights_gathered, a, b)
-  thread_sums_abs_score = parallel_iterate(data_count) do thread_range
-    thread_sum_abs_Δscore = Score(0)
-    @inbounds for ii in thread_range
-      thread_sum_abs_Δscore += abs(a*unbinned[ii] + b) * weights_gathered[ii]
-    end
-    thread_sum_abs_Δscore
-  end
-
-  sum(thread_sums_abs_score)
-end
-
-function Σdloss_vec_Σloss_hessian(unbinned, y_gathered, weights_gathered, scores_gathered, a, b, iis)
-  # Σloss         = zero(Loss)
-  Σdloss_vec    = Loss[0.0, 0.0]
-  Σloss_hessian = Loss[0.0 0.0; 0.0 0.0]
-  @inbounds for ii in iis
-    feature_val = unbinned[ii]
-    y_i         = y_gathered[ii]
-    ŷ_i         = σ(scores_gathered[ii] + a*feature_val + b)
-
-    # Σloss += logloss(y_i, ŷ_i) * weights_gathered[ii]
-
-    dloss  = ∇logloss(y_i, ŷ_i) * weights_gathered[ii]
-    ddloss = ∇∇logloss(ŷ_i)     * weights_gathered[ii]
-
-    Σdloss_vec[1] += dloss*feature_val # da
-    Σdloss_vec[2] += dloss             # db
-
-    # https://thelaziestprogrammer.com/sharrington/math-of-machine-learning/solving-logreg-newtons-method#the-math-putting-it-all-together
-    Σloss_hessian[1,1] += ddloss*feature_val*feature_val
-    Σloss_hessian[2,1] += ddloss*feature_val
-    Σloss_hessian[1,2] += ddloss*feature_val
-    Σloss_hessian[2,2] += ddloss
-  end
-  (Σdloss_vec, Σloss_hessian)
-end
-
 end # module MemoryConstrainedTreeBoosting
-
-

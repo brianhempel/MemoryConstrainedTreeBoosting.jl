@@ -53,12 +53,10 @@ validation_weights = weights[1:3]
       iteration_count = 20,
       min_data_weight_in_leaf = 2.0,
       learning_rate = 0.3,
-      min_data_to_regress_in_leaf = 4,
       validation_X       = validation_X,
       validation_y       = validation_y,
       validation_weights = validation_weights
     )
-println()
 
 bin_splits :: Vector{MemoryConstrainedTreeBoosting.BinSplits{Float32}}
 
@@ -74,13 +72,13 @@ trees      :: Vector{MemoryConstrainedTreeBoosting.Tree}
 
 X_binned = apply_bins(X, bin_splits)
 
-println(predict_on_binned(X_binned, trees, bin_splits))
+println(predict_on_binned(X_binned, trees))
 println(y)
 
-# println("Unbinned predictor")
-# unbinned_predict = load_unbinned_predictor(save_path)
-#
-# println(unbinned_predict(X))
-# println(y)
-#
-# @assert sum(abs.(predict_on_binned(X_binned, trees) - unbinned_predict(X))) < 0.00001
+println("Unbinned predictor")
+unbinned_predict = load_unbinned_predictor(save_path)
+
+println(unbinned_predict(X))
+println(y)
+
+@assert sum(abs.(predict_on_binned(X_binned, trees) - unbinned_predict(X))) < 0.00001
