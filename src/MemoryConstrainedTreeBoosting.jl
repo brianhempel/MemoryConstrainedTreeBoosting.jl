@@ -1171,7 +1171,31 @@ function _build_histogram_unrolled!(X_binned, feature_start_i, ∇losses, ∇∇
   ()
 end
 
+# $ sudo perf stat -B -a -d sleep 300
+
+#  Performance counter stats for 'system wide':
+
+#       9,599,528.20 msec cpu-clock                 #   31.998 CPUs utilized
+#          3,021,958      context-switches          #    0.315 K/sec
+#             42,504      cpu-migrations            #    0.004 K/sec
+#         18,966,535      page-faults               #    0.002 M/sec
+# 15,578,104,049,383      cycles                    #    1.623 GHz                      (40.00%)
+# 14,510,053,924,294      stalled-cycles-frontend   #   93.14% frontend cycles idle     (50.00%)
+# 10,431,986,116,034      stalled-cycles-backend    #   66.97% backend cycles idle      (50.00%)
+# 12,889,788,964,692      instructions              #    0.83  insn per cycle
+#                                                   #    1.13  stalled cycles per insn  (60.00%)
+#    611,519,387,938      branches                  #   63.703 M/sec                    (60.00%)
+#      3,122,439,194      branch-misses             #    0.51% of all branches          (60.00%)
+#  6,463,883,611,164      L1-dcache-loads           #  673.354 M/sec                    (34.33%)
+#    474,313,448,229      L1-dcache-load-misses     #    7.34% of all L1-dcache hits    (32.79%)
+#    105,581,747,978      LLC-loads                 #   10.999 M/sec                    (20.00%)
+#     29,421,821,984      LLC-load-misses           #   27.87% of all LL-cache hits     (30.00%)
+
+#      300.004860572 seconds time elapsed
+
 function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, features_histograms, leaf_is)
+
+  println((length(leaf_is), length(feature_is_to_compute)))
 
   # For SREF, up to 27.7mb of leaf_is, and always 57.6mb of ∇losses,∇∇losses,weights
   # For HRRR (9897675 datapoints with 18577 features each), up to 40mb leaf_is (usually much less); always 113mb ∇losses,∇∇losses,weights; always 54mb of feature histograms; 171GB of X_binned
@@ -1193,6 +1217,9 @@ function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
+
+  start_time = time_ns()
+
   parallel_iterate(length(feature_is_to_compute)) do thread_range
 
     for chunk_feature_ii in thread_range.start:features_chunk_size:thread_range.stop
@@ -1211,7 +1238,28 @@ function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature
       end
       ()
     end
+
   end
+
+  duration = (time_ns() - start_time) / 1e9
+
+  bytes_dispactched = length(leaf_is)*length(feature_is_to_compute)
+
+
+  cache_line_start = leaf_is[1]
+  cache_lines_est = 1
+  for i in leaf_is
+    if i >= cache_line_start+64
+      cache_line_start = i
+      cache_lines_est += 1
+    end
+  end
+
+  est_memory_access = cache_lines_est*64*length(feature_is_to_compute)
+
+  max_memory_accessed = min(length(∇losses)*length(feature_is_to_compute), 64*bytes_dispactched)
+
+  println("$(bytes_dispactched/duration/1024/1024/1024)-$(max_memory_accessed/duration/1024/1024/1024) GB/s, likely $(est_memory_access/duration/1024/1024/1024) GB/s\t$(Float32(duration))s")
 
 end
 
