@@ -1032,14 +1032,16 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses, ∇∇losses, wei
 
         feature_is_to_compute = filter(feature_i -> isnothing(leaf.features_histograms[feature_i]), feature_is)
 
-        Threads.@threads for feature_i in feature_is_to_compute
-          leaf.features_histograms[feature_i] = Histogram(max_bins)
+        if !isempty(feature_is_to_compute)
+          Threads.@threads for feature_i in feature_is_to_compute
+            leaf.features_histograms[feature_i] = Histogram(max_bins)
+          end
+
+          # println(@code_llvm compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, leaf.features_histograms, leaf.is))
+          # println()
+
+          compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, leaf.features_histograms, leaf.is)
         end
-
-        # println(@code_llvm compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, leaf.features_histograms, leaf.is))
-        # println()
-
-        compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, leaf.features_histograms, leaf.is)
 
         leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
       end
@@ -1185,11 +1187,9 @@ function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature
       Int64(round(pts_per_∇losses_cache_line * cache_lines / 3)) # That 85k needs to be shared over 3 arrays: ∇losses, ∇∇losses, weights
     end
 
-  features_chunk_size = 32 #*Threads.nthreads()
+  features_chunk_size = 32
 
-  # 3. parallel_iterate futher out for better thread utilization
-  # 4. consolidate ∇losses,∇∇losses,weights when leaf_is is small? ()
-
+  # consolidate ∇losses,∇∇losses,weights when leaf_is is small?
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
@@ -1200,7 +1200,6 @@ function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature
 
       for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
         for feature_i in chunk_feature_is_to_compute # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
-          # feature_i    = chunk_feature_is_to_compute[feature_ii]
 
           Σ∇losses     = features_histograms[feature_i].Σ∇losses
           Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
