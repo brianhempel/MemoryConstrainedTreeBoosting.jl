@@ -1,13 +1,17 @@
+def bench
+  times = `make profile`.scan(/[\d\.]+ seconds/).map(&:to_f)
+  mean_time = times.sum / times.size
+  puts "#{mean_time} seconds"
+  mean_time
+end
+
 def bench_chunk_sizes(chunk_size_1, chunk_size_2)
   print "#{chunk_size_1}\t#{chunk_size_2}\t"
   code = File.read("src/MemoryConstrainedTreeBoosting.jl")
   code.sub!(/is_chunk_size = isa\(leaf_is, UnitRange\) \? \d+ : \d+/, "is_chunk_size = isa(leaf_is, UnitRange) ? #{chunk_size_1} : #{chunk_size_2}")
   File.write("src/MemoryConstrainedTreeBoosting.jl", code)
   sleep 15
-  times = `make profile`.scan(/[\d\.]+ seconds/).map(&:to_f)
-  mean_time = times.sum / times.size
-  puts "#{mean_time} seconds"
-  mean_time
+  bench
 end
 
 def bench_feature_chunk_size(chunk_size)

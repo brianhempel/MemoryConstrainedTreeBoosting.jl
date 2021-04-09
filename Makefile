@@ -11,5 +11,5 @@ profile:
 
 evaluate:
 	# May need to turn threads off in various functions
-	julia --project=. test/Evaluation.jl
-	# JULIA_NUM_THREADS=4 julia --project=. test/Evaluation.jl
+	# julia --project=. test/Evaluation.jl
+	JULIA_NUM_THREADS=4 julia --project=. test/Evaluation.jl

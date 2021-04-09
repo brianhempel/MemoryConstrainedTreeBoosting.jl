@@ -878,10 +878,10 @@ function build_one_tree(X_binned :: Data, ∇losses, ∇∇losses, weights, is, 
       []       # feature_histograms
     )
 
-  features_to_use_count = Int64(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+  features_to_use_count = UInt32(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
 
   # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
-  feature_is = sort(Random.shuffle(1:feature_count(X_binned))[1:features_to_use_count])
+  feature_is = sort(Random.shuffle(UInt32(1):UInt32(feature_count(X_binned)))[1:features_to_use_count])
 
   tree_changed = true
 
@@ -1120,7 +1120,7 @@ end
 # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
 function build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
 
-  _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
+  _build_histogram_unrolled!(X_binned, size(X_binned,1)*(feature_i-1), ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
 
   first_ii_unprocessed =
     leaf_ii_start + 2*length(leaf_ii_start:2:(leaf_ii_stop-1))
@@ -1135,14 +1135,11 @@ function build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses,
   end
 end
 
-function _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
+function _build_histogram_unrolled!(X_binned, feature_start_i, ∇losses, ∇∇losses, weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights)
   # Memory per datapoint = 4 (leaf_is) + 1  (featue_binned) + 4  (∇losses) + 4  (∇∇losses) +  4 (weights) =  17 bytes if dense
   # Memory per datapoint = 4 (leaf_is) + 64 (featue_binned) + 64 (∇losses) + 64 (∇∇losses) + 64 (weights) = 260 bytes if sparse (different cache lines)
   #
   # Conservatively assuming 1MB shared cache, that's 60,000 datapoints in cache if dense, or 4,000 if sparse
-  #
-  # Measured drift (MacOS, 4 cores) is 1 datapoint drift for every 6 datapoints, which means we want to
-  # sync at most every 360,000 points (dense) or 24,000 points (sparse)
 
   @inbounds for ii in leaf_ii_start:2:(leaf_ii_stop-1)
     i1 = leaf_is[ii]
@@ -1150,8 +1147,8 @@ function _build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses
     # i3 = leaf_is[ii+2]
     # i4 = leaf_is[ii+3]
 
-    bin_i1 = X_binned[i1, feature_i]
-    bin_i2 = X_binned[i2, feature_i]
+    bin_i1 = X_binned[feature_start_i + i1]
+    bin_i2 = X_binned[feature_start_i + i2]
     # bin_i3 = feature_binned[i3]
     # bin_i4 = feature_binned[i4]
 
@@ -1175,25 +1172,41 @@ end
 function compute_histograms!(X_binned, ∇losses, ∇∇losses, weights, feature_is_to_compute, features_histograms, leaf_is)
 
   # For SREF, up to 27.7mb of leaf_is, and always 57.6mb of ∇losses,∇∇losses,weights
+  # For HRRR (9897675 datapoints with 18577 features each), up to 40mb leaf_is (usually much less); always 113mb ∇losses,∇∇losses,weights; always 54mb of feature histograms; 171GB of X_binned
 
   # Cache-optimal chunk sizes for root and others, chosen by search.
-  is_chunk_size = isa(leaf_is, UnitRange) ? 8704 : 448
-  features_chunk_size = 32*Threads.nthreads()
+  is_chunk_size =
+    if isa(leaf_is, UnitRange)
+      8704
+    else
+      data_fraction = length(leaf_is) / length(∇losses)
+      pts_per_∇losses_cache_line = ceil(16 * data_fraction)
+      cache_lines = 85*1024 / 64 # Target 85k, earlier experiments pointed to 448 optimal chunk size
+      Int64(round(pts_per_∇losses_cache_line * cache_lines / 3)) # That 85k needs to be shared over 3 arrays: ∇losses, ∇∇losses, weights
+    end
 
-  # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned
+  features_chunk_size = 32 #*Threads.nthreads()
+
+  # 3. parallel_iterate futher out for better thread utilization
+  # 4. consolidate ∇losses,∇∇losses,weights when leaf_is is small? ()
+
+
+  # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses, ∇∇losses, weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
-  for chunk_feature_ii in 1:features_chunk_size:length(feature_is_to_compute)
-    chunk_feature_is_to_compute = view(feature_is_to_compute, chunk_feature_ii:min(chunk_feature_ii+features_chunk_size-1, length(feature_is_to_compute)))
+  parallel_iterate(length(feature_is_to_compute)) do thread_range
 
-    parallel_iterate(length(chunk_feature_is_to_compute)) do thread_range
-      for ii in 1:is_chunk_size:length(leaf_is)
-        for feature_ii in thread_range
-          feature_i      = chunk_feature_is_to_compute[feature_ii]
+    for chunk_feature_ii in thread_range.start:features_chunk_size:thread_range.stop
+      chunk_feature_is_to_compute = view(feature_is_to_compute, chunk_feature_ii:min(chunk_feature_ii+features_chunk_size-1, thread_range.stop))
+
+      for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
+        for feature_i in chunk_feature_is_to_compute # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
+          # feature_i    = chunk_feature_is_to_compute[feature_ii]
 
           Σ∇losses     = features_histograms[feature_i].Σ∇losses
           Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
           data_weights = features_histograms[feature_i].data_weights
 
+          # Always 171GB of X_binned loading (unavoidable)
           build_histogram_unrolled!(X_binned, feature_i, ∇losses, ∇∇losses, weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), Σ∇losses, Σ∇∇losses, data_weights)
         end
       end

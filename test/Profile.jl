@@ -8,8 +8,9 @@ using Profile
 Random.seed!(123456)
 
 # For SREF, datapoint/feature ratio is ~370:1
-feature_count = 5000
-point_count   = feature_count*200
+# For HRRR, 530:1
+feature_count = 4000
+point_count   = feature_count*400
 
 # X       = randn(Float32, (point_count, feature_count))
 y       = round.(rand(MemoryConstrainedTreeBoosting.Prediction, point_count))
