@@ -742,6 +742,7 @@ index_type(array) = length(array) < typemax(UInt32) ? UInt32 : Int64
 # Reusable memory to avoid allocations between trees.
 mutable struct ScratchMemory
   ∇losses_∇∇losses_weights :: Vector{Loss}
+  ∇losses_∇∇losses_weights_consolidated :: Vector{Loss}
   # ∇losses  :: Vector{Loss}
   # ∇∇losses :: Vector{Loss}
   # weights  :: Union{Nothing,Vector{DataWeight}}
@@ -752,6 +753,7 @@ mutable struct ScratchMemory
   ScratchMemory(y) =
     new(
       Vector{Loss}(undef, length(y)*4),
+      Vector{Loss}(undef, length(y)*2),
       # Vector{Loss}(undef, length(y)),
       # get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(y)) : nothing,
       Vector{index_type(y)}(undef, length(y)),
@@ -827,6 +829,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
 
 
   ∇losses_∇∇losses_weights = scratch_memory.∇losses_∇∇losses_weights
+  ∇losses_∇∇losses_weights_scratch = scratch_memory.∇losses_∇∇losses_weights_consolidated
   # ∇losses  = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y))          : scratch_memory.∇losses
   # ∇∇losses = isnothing(scratch_memory) ? Vector{Loss}(undef, length(y))          : scratch_memory.∇∇losses
   is       = scratch_memory.is
@@ -837,7 +840,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weights)
 
-  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, is, trues, falses; config...)
+  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
@@ -875,7 +878,7 @@ function bagged_weights!(weights, bagging_temperature, out)
   ()
 end
 
-function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, is, trues, falses; config...)
+function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses; config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
   tree =
@@ -899,7 +902,7 @@ function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, is, tr
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, is, feature_is, trues, falses; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses; config...)
   end
 
   tree
@@ -1037,7 +1040,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, is, feature_is, trues, falses; config...)
+function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses; config...)
   leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -1086,7 +1089,17 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
           # println(@code_llvm compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, leaf.features_histograms, leaf.is))
           # println()
 
-          compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, leaf.features_histograms, leaf.is)
+          # # consolidate ∇losses,∇∇losses,weights when leaf_is is small?
+          ∇losses_∇∇losses_weights_consolidated =
+            if isa(leaf.is, UnitRange)
+              ∇losses_∇∇losses_weights
+            elseif length(leaf.is) <= div(data_count(X_binned),2)
+              consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf.is, ∇losses_∇∇losses_weights_scratch)
+            else
+              throw(:leaf_is_length_should_never_be_more_than_half_the_real_total)
+            end
+
+          compute_histograms!(X_binned, ∇losses_∇∇losses_weights_consolidated, feature_is_to_compute, leaf.features_histograms, leaf.is)
         end
 
         leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
@@ -1165,8 +1178,136 @@ end
 
 # import InteractiveUtils
 
-# Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
+# # # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
+# # sliiiightly faster, 2.2, 2.3gb/s, ~50s total
+# function build_histogram_unrolled!(X_binned, feature_i, ∇losses_∇∇losses_weights, leaf_is :: UnitRange, leaf_ii_start, leaf_ii_stop, histogram)
 
+#   # println(InteractiveUtils.@code_llvm _build_histogram_unrolled!(X_binned, size(X_binned,1)*(feature_i-1), ∇losses_∇∇losses_weights, leaf_is, leaf_ii_start, leaf_ii_stop, Σ∇losses, Σ∇∇losses, data_weights))
+#   # throw(:crash)
+
+#   stride = 4
+
+#   _build_histogram_unrolled!(X_binned, size(X_binned,1)*(feature_i-1), ∇losses_∇∇losses_weights, leaf_ii_start, leaf_ii_stop, histogram)
+
+#   first_ii_unprocessed =
+#     leaf_ii_start + stride*length(leaf_ii_start:2:(leaf_ii_stop-1))
+
+#   # The last couple points...
+#   @inbounds for ii in first_ii_unprocessed:leaf_ii_stop
+#     i = leaf_is[ii]
+#     bin_i = llw_base_i(X_binned[i, feature_i])
+#     llw_i = llw_base_i(i)
+#     histogram[bin_i]   += ∇losses_∇∇losses_weights[llw_i]
+#     histogram[bin_i+1] += ∇losses_∇∇losses_weights[llw_i+1]
+#     histogram[bin_i+2] += ∇losses_∇∇losses_weights[llw_i+2]
+#   end
+# end
+
+# function _build_histogram_unrolled!(X_binned, feature_start_i, ∇losses_∇∇losses_weights, leaf_i_start, leaf_i_stop, histogram)
+#   # Memory per datapoint = 4 (leaf_is) + 1  (featue_binned) + 4  (∇losses) + 4  (∇∇losses) +  4 (weights) =  17 bytes if dense
+#   # Memory per datapoint = 4 (leaf_is) + 64 (featue_binned) + 64 (∇losses) + 64 (∇∇losses) + 64 (weights) = 260 bytes if sparse (different cache lines)
+#   #
+#   # Conservatively assuming 1MB shared cache, that's 60,000 datapoints in cache if dense, or 4,000 if sparse
+
+#   stride = 4
+
+#   @inbounds for i1 in leaf_i_start:stride:(leaf_i_stop-stride+1)
+#     # i1 = leaf_is[ii]
+#     # i2 = i1+1
+#     # i3 = i1+2
+#     # i4 = i1+3
+#     llw_i1 = llw_base_i(i1)
+#     feature_base_i = feature_start_i + i1
+
+#     bin_i1 = llw_base_i(X_binned[feature_base_i])
+#     bin_i2 = llw_base_i(X_binned[feature_base_i + 1])
+#     bin_i3 = llw_base_i(X_binned[feature_base_i + 2])
+#     bin_i4 = llw_base_i(X_binned[feature_base_i + 3])
+
+
+#     # llw_i1 = llw_base_i(i1)
+#     # llw_i2 = llw_base_i(i2)
+#     # # bin_i3 = feature_binned[i3]
+#     # # bin_i4 = feature_binned[i4]
+
+#     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
+#     bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i1)
+#     loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i1)
+#     SIMD.vstorea(bin + loss_info, histogram, bin_i1)
+
+#     bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i2)
+#     loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i1 + 4)
+#     SIMD.vstorea(bin + loss_info, histogram, bin_i2)
+
+#     bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i3)
+#     loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i1 + 8)
+#     SIMD.vstorea(bin + loss_info, histogram, bin_i3)
+
+#     bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i4)
+#     loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i1 + 12)
+#     SIMD.vstorea(bin + loss_info, histogram, bin_i4)
+
+#     # histogram[bin_i1]     += ∇losses_∇∇losses_weights[llw_i1]
+#     # histogram[bin_i2]     += ∇losses_∇∇losses_weights[llw_i2]
+#     # # Σ∇losses[bin_i3]     += ∇losses[i3]
+#     # # Σ∇losses[bin_i4]     += ∇losses[i4]
+#     # histogram[bin_i1+1]    += ∇losses_∇∇losses_weights[llw_i1+1]
+#     # histogram[bin_i2+1]    += ∇losses_∇∇losses_weights[llw_i2+1]
+#     # # Σ∇∇losses[bin_i3]    += ∇∇losses[i3]
+#     # # Σ∇∇losses[bin_i4]    += ∇∇losses[i4]
+#     # histogram[bin_i1+2] += ∇losses_∇∇losses_weights[llw_i1+2]
+#     # histogram[bin_i2+2] += ∇losses_∇∇losses_weights[llw_i2+2]
+#     # # data_weights[bin_i3] += weights[i3]
+#     # # data_weights[bin_i4] += weights[i4]
+#   end
+
+#   ()
+# end
+
+# Get all our cache misses out of the way in one go.
+# Stores result in out (and returns out)
+function consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf_is, out)
+  parallel_iterate(length(leaf_is)) do thread_range
+    stride = 4
+    leaf_ii_stop = thread_range.stop - stride + 1
+    consolidate_∇losses_∇∇losses_weights_unrolled!(∇losses_∇∇losses_weights, leaf_is, thread_range.start, leaf_ii_stop, out)
+
+    first_ii_unprocessed = last(thread_range.start:stride:leaf_ii_stop) < 1 ? 1 : last(thread_range.start:stride:leaf_ii_stop) + stride
+    # first_ii_unprocessed = thread_range.start
+
+    # The last couple points...
+    llw_i_out = llw_base_i(first_ii_unprocessed)
+    @inbounds for leaf_ii in first_ii_unprocessed:thread_range.stop
+      llw_i = llw_base_i(leaf_is[leaf_ii])
+      SIMD.vstorea(
+        SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i),
+        out,
+        llw_i_out
+      )
+      llw_i_out += 4
+    end
+  end
+  out
+end
+
+function consolidate_∇losses_∇∇losses_weights_unrolled!(∇losses_∇∇losses_weights, leaf_is, leaf_ii_start, leaf_ii_stop, out)
+  llw_i_out = llw_base_i(leaf_ii_start)
+  @inbounds for leaf_ii in (leaf_ii_start:4:leaf_ii_stop)
+    llw_i1 = llw_base_i(leaf_is[leaf_ii])
+    llw_i2 = llw_base_i(leaf_is[leaf_ii+1])
+    llw_i3 = llw_base_i(leaf_is[leaf_ii+2])
+    llw_i4 = llw_base_i(leaf_is[leaf_ii+3])
+    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i1)
+    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i2)
+    loss_info3 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i3)
+    loss_info4 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i4)
+    SIMD.vstorea(loss_info1, out, llw_i_out)
+    SIMD.vstorea(loss_info2, out, llw_i_out+4)
+    SIMD.vstorea(loss_info3, out, llw_i_out+8)
+    SIMD.vstorea(loss_info4, out, llw_i_out+12)
+    llw_i_out += 16
+  end
+end
 
 # # Mutates the histogram parts: Σ∇losses, Σ∇∇losses, data_weights
 #  Like 2.1 2.3 GB/s, 50s total
@@ -1184,7 +1325,7 @@ function build_histogram_unrolled!(X_binned, feature_i, ∇losses_∇∇losses_w
   @inbounds for ii in first_ii_unprocessed:leaf_ii_stop
     i = leaf_is[ii]
     bin_i = llw_base_i(X_binned[i, feature_i])
-    llw_i = llw_base_i(i)
+    llw_i = llw_base_i(ii)
     histogram[bin_i]   += ∇losses_∇∇losses_weights[llw_i]
     histogram[bin_i+1] += ∇losses_∇∇losses_weights[llw_i+1]
     histogram[bin_i+2] += ∇losses_∇∇losses_weights[llw_i+2]
@@ -1213,11 +1354,12 @@ function _build_histogram_unrolled!(X_binned, feature_start_i, ∇losses_∇∇l
 
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
     bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i1)
-    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(i1))
+    loss_info_i = llw_base_i(ii)
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
     SIMD.vstorea(bin + loss_info, histogram, bin_i1)
 
     bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i2)
-    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(i2))
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
     SIMD.vstorea(bin + loss_info, histogram, bin_i2)
 
     # histogram[bin_i1]     += ∇losses_∇∇losses_weights[llw_i1]
@@ -1255,7 +1397,7 @@ function build_2histograms_unrolled!(X_binned, feature_i1, feature_i2, ∇losses
     i = leaf_is[ii]
     feat1_bin_i = llw_base_i(X_binned[i, feature_i1])
     feat2_bin_i = llw_base_i(X_binned[i, feature_i2])
-    llw_i = llw_base_i(i)
+    llw_i = llw_base_i(ii)
     histogram1[feat1_bin_i]   += ∇losses_∇∇losses_weights[llw_i]
     histogram1[feat1_bin_i+1] += ∇losses_∇∇losses_weights[llw_i+1]
     histogram1[feat1_bin_i+2] += ∇losses_∇∇losses_weights[llw_i+2]
@@ -1283,8 +1425,9 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     # # bin_i3 = feature_binned[i3]
     # # bin_i4 = feature_binned[i4]
 
-    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(i1))
-    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(i2))
+    loss_info_i = llw_base_i(ii)
+    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
+    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
 
     feat1_bin_i1 = llw_base_i(X_binned[feature_start_i1 + i1])
     feat2_bin_i1 = llw_base_i(X_binned[feature_start_i2 + i1])
@@ -1323,6 +1466,8 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
   ()
 end
 
+# Before:
+
 # $ sudo perf stat -B -a -d sleep 300
 
 #  Performance counter stats for 'system wide':
@@ -1345,6 +1490,16 @@ end
 
 #      300.004860572 seconds time elapsed
 
+# Profile.jl: 48.9s (1,600,000 pts x 4000 features)
+# ProfileHRRR.jl: 51.3s (734,269 pts x 9288 features)
+
+
+# After:
+
+# Profile.jl: 39.7s (19% faster)
+# ProfileHRRR.jl: 38.3s (25% faster)
+
+
 function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, features_histograms, leaf_is)
 
   # println((length(leaf_is), length(feature_is_to_compute)))
@@ -1353,19 +1508,17 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
   # For HRRR (9897675 datapoints with 18577 features each), up to 40mb leaf_is (usually much less); always 113mb ∇losses,∇∇losses,weights; always 54mb of feature histograms; 171GB of X_binned
 
   # Cache-optimal chunk sizes for root and others, chosen by search.
-  is_chunk_size =
-    if isa(leaf_is, UnitRange)
-      8704
-    else
-      data_fraction = length(leaf_is) / length(data_count(X_binned))
-      pts_per_∇losses_cache_line = ceil(16 * data_fraction)
-      cache_lines = 85*1024 / 64 # Target 85k, earlier experiments pointed to 448 optimal chunk size
-      Int64(round(pts_per_∇losses_cache_line * cache_lines / 4)) # That 85k needs to be shared over 3 arrays: ∇losses_∇∇losses_weights
-    end
+  is_chunk_size = 8704
+    # if isa(leaf_is, UnitRange)
+    #   8704
+    # else
+    #   data_fraction = length(leaf_is) / data_count(X_binned)
+    #   pts_per_∇losses_cache_line = ceil(16 * data_fraction)
+    #   cache_lines = 85*1024 / 64 # Target 85k, earlier experiments pointed to 448 optimal chunk size
+    #   Int64(round(pts_per_∇losses_cache_line * cache_lines / 4)) # That 85k needs to be shared over 3 arrays: ∇losses_∇∇losses_weights
+    # end
 
   features_chunk_size = 32
-
-  # consolidate ∇losses,∇∇losses,weights when leaf_is is small?
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses_∇∇losses_weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
