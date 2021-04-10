@@ -24,14 +24,15 @@ X_binned   = rand(UInt8(1):UInt8(255), (point_count, feature_count))
 
 validation_range = 1:div(point_count,3)
 
-iteration_callback =
+function make_iteration_callback()
   make_callback_to_track_validation_loss(
       X_binned[validation_range, :],
       y[validation_range];
       validation_weights = weights[validation_range]
     )
+end
 
-trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.8, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.8, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
 # trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 100, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5)
 #
 # save_path = tempname()
@@ -61,8 +62,8 @@ trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, fea
 # ProfileView.view()
 # read(stdin,UInt8)
 
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = iteration_callback)
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
