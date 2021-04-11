@@ -958,8 +958,8 @@ end
 
 # @inline llw_base_i(i) = 1+(i-1)*4
 @inline llw_base_i(i) = -3 + 4*i
-llw_∇losses(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_weights[1:4:length(∇losses_∇∇losses_weights)-3]
-llw_∇∇losses(∇losses_∇∇losses_weights) = @view ∇losses_∇∇losses_weights[2:4:length(∇losses_∇∇losses_weights)-2]
+llw_∇losses(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_weights[1:4:length(∇losses_∇∇losses_weights)]
+llw_∇∇losses(∇losses_∇∇losses_weights) = @view ∇losses_∇∇losses_weights[2:4:length(∇losses_∇∇losses_weights)]
 llw_weights(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_weights[3:4:length(∇losses_∇∇losses_weights)]
 
 function compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights)
