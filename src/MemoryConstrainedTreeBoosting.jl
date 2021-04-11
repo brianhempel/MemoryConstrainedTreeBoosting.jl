@@ -1508,7 +1508,8 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
   # For HRRR (9897675 datapoints with 18577 features each), up to 40mb leaf_is (usually much less); always 113mb ∇losses,∇∇losses,weights; always 54mb of feature histograms; 171GB of X_binned
 
   # Cache-optimal chunk sizes for root and others, chosen by search.
-  is_chunk_size = 8704
+  # is_chunk_size = 8704
+  is_chunk_size = isa(leaf_is, UnitRange) ? 8704 : 8704
     # if isa(leaf_is, UnitRange)
     #   8704
     # else
