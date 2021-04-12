@@ -1490,6 +1490,8 @@ end
 
 #      300.004860572 seconds time elapsed
 
+
+
 # Profile.jl: 48.9s (1,600,000 pts x 4000 features)
 # ProfileHRRR.jl: 51.3s (734,269 pts x 9288 features)
 
@@ -1499,6 +1501,29 @@ end
 # Profile.jl: 39.7s (19% faster)
 # ProfileHRRR.jl: 38.3s (25% faster)
 
+# what's the limiter?
+# per feature-datapoint we must do the following if processing one feature at a time:
+# 1. 1 load to get the feature (there may be a fancy way to consolidate this when the data is dense)
+# 2. 1 load to get the loss info
+# 3. 1 load to get the bin's loss info (dependent on step 1)
+# 4. 1 store to store the bin's new loss info
+
+# So that's 3 L1 loads per feature-datapoint
+# ~2 passes over the data
+# * 170,000,000,000 feature-datapoints
+# * 3 loads/each
+# / 2 loads per cycle (Sandy Bridge)
+# / 3,100,000,000 cycles per second
+# / 16 cores
+# = 10 seconds
+
+# ~2 passes over the data
+# * 170GB
+# / 50GB/s DRAM bandwidth
+# = 7 seconds
+
+# But the limiter is probably the dependency between points: can't load a new bin until the first is saved.
+# load (4) + add (3) + store... 5 cycles => 48 seconds
 
 function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, features_histograms, leaf_is)
 
