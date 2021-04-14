@@ -1454,6 +1454,112 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
   ()
 end
 
+
+function build_3histograms_unrolled!(X_binned, feature_i1, feature_i2, feature_i3, ∇losses_∇∇losses_weights, leaf_is, leaf_ii_start, leaf_ii_stop, hists)
+
+  # println(InteractiveUtils.@code_llvm _build_2histograms_unrolled!(X_binned, size(X_binned,1)*(feature_i1-1), size(X_binned,1)*(feature_i2-1), ∇losses_∇∇losses_weights, leaf_is, leaf_ii_start, leaf_ii_stop, histogram1, histogram2))
+  # println(InteractiveUtils.@code_native _build_2histograms_unrolled!(X_binned, size(X_binned,1)*(feature_i1-1), size(X_binned,1)*(feature_i2-1), ∇losses_∇∇losses_weights, leaf_is, leaf_ii_start, leaf_ii_stop, histogram1, histogram2))
+  # throw(:crash)
+
+  _build_3histograms_unrolled!(
+    X_binned,
+    size(X_binned,1)*(feature_i1-1),
+    size(X_binned,1)*(feature_i2-1),
+    size(X_binned,1)*(feature_i3-1),
+    # size(X_binned,1)*(feature_i4-1),
+    # feature_i1, feature_i2, feature_i3,
+    ∇losses_∇∇losses_weights,
+    leaf_is, leaf_ii_start, leaf_ii_stop,
+    hists
+    # features_histograms
+    # (features_histograms[feature_i1], features_histograms[feature_i2], features_histograms[feature_i3])
+    # (features_histograms[feature_i1], features_histograms[feature_i2], features_histograms[feature_i3], features_histograms[feature_i4])
+  )
+
+  # first_ii_unprocessed =
+  #   leaf_ii_start + 2*length(leaf_ii_start:2:(leaf_ii_stop-1))
+
+  # # The last couple points...
+  # @inbounds for ii in first_ii_unprocessed:leaf_ii_stop
+  #   i = leaf_is[ii]
+  #   feat1_bin_i = llw_base_i(X_binned[i, feature_i1])
+  #   feat2_bin_i = llw_base_i(X_binned[i, feature_i2])
+  #   feat3_bin_i = llw_base_i(X_binned[i, feature_i3])
+  #   llw_i = llw_base_i(ii)
+  #   histogram1[feat1_bin_i]   += ∇losses_∇∇losses_weights[llw_i]
+  #   histogram1[feat1_bin_i+1] += ∇losses_∇∇losses_weights[llw_i+1]
+  #   histogram1[feat1_bin_i+2] += ∇losses_∇∇losses_weights[llw_i+2]
+  #   histogram2[feat2_bin_i]   += ∇losses_∇∇losses_weights[llw_i]
+  #   histogram2[feat2_bin_i+1] += ∇losses_∇∇losses_weights[llw_i+1]
+  #   histogram2[feat2_bin_i+2] += ∇losses_∇∇losses_weights[llw_i+2]
+  #   histogram3[feat3_bin_i]   += ∇losses_∇∇losses_weights[llw_i]
+  #   histogram3[feat3_bin_i+1] += ∇losses_∇∇losses_weights[llw_i+1]
+  #   histogram3[feat3_bin_i+2] += ∇losses_∇∇losses_weights[llw_i+2]
+  # end
+end
+
+function _build_3histograms_unrolled!(X_binned, feature_start_i1, feature_start_i2, feature_start_i3, ∇losses_∇∇losses_weights, leaf_is, leaf_ii_start, leaf_ii_stop, hists)
+  # Memory per datapoint = 4 (leaf_is) + 1  (featue_binned) + 4  (∇losses) + 4  (∇∇losses) +  4 (weights) =  17 bytes if dense
+  # Memory per datapoint = 4 (leaf_is) + 64 (featue_binned) + 64 (∇losses) + 64 (∇∇losses) + 64 (weights) = 260 bytes if sparse (different cache lines)
+  #
+  # Conservatively assuming 1MB shared cache, that's 60,000 datapoints in cache if dense, or 4,000 if sparse
+
+  histogram1 = hists.hist1
+  histogram2 = hists.hist2
+  histogram3 = hists.hist3
+  # histogram4 = hists.hist4
+
+  @inbounds for ii in leaf_ii_start:leaf_ii_stop
+    i1 = leaf_is[ii]
+    # i2 = leaf_is[ii+1]
+    # i3 = leaf_is[ii+2]
+    # i4 = leaf_is[ii+3]
+
+
+    # llw_i1 = llw_base_i(i1)
+    # llw_i2 = llw_base_i(i2)
+    # # bin_i3 = feature_binned[i3]
+    # # bin_i4 = feature_binned[i4]
+    # feat3_bin_i = llw_base_i(X_binned[feature_start_i3 + i])
+
+
+    # feat1_bin_i1 = llw_base_i(X_binned[i1, feature_i1])
+    # feat2_bin_i1 = llw_base_i(X_binned[i1, feature_i2])
+    # feat3_bin_i1 = llw_base_i(X_binned[i1, feature_i3])
+    feat1_bin_i1 = llw_base_i(X_binned[feature_start_i1 + i1])
+    feat2_bin_i1 = llw_base_i(X_binned[feature_start_i2 + i1])
+    feat3_bin_i1 = llw_base_i(X_binned[feature_start_i3 + i1])
+    # feat4_bin_i1 = llw_base_i(X_binned[feature_start_i4 + i1])
+
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(ii))
+    # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
+    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1)
+    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i1)
+    # feat4_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram4, feat4_bin_i1)
+
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1) + loss_info, histogram1, feat1_bin_i1)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1) + loss_info, histogram2, feat2_bin_i1)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i1) + loss_info, histogram3, feat3_bin_i1)
+    # SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram4, feat4_bin_i1) + loss_info, histogram4, feat4_bin_i1)
+    # SIMD.vstorea(feat4_bin + loss_info, features_histograms[4], feat4_bin_i1)
+    # SIMD.vstorea(feat3_bin + loss_info, histogram3, feat3_bin_i)
+
+    # feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
+    # feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
+
+    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i2)
+    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i2)
+    # SIMD.vstorea(feat1_bin + loss_info2, histogram1, feat1_bin_i2)
+    # SIMD.vstorea(feat2_bin + loss_info2, histogram2, feat2_bin_i2)
+  end
+
+  ()
+end
+
+
+
 # Before:
 
 # $ sudo perf stat -B -a -d sleep 300
@@ -1516,6 +1622,13 @@ end
 # ProfileHRRR.jl: 39.7s before reordering
 # ProfileHRRR.jl: 38.2s minor reordering
 
+mutable struct Hists
+  hist1 :: Vector{Loss}
+  hist2 :: Vector{Loss}
+  hist3 :: Vector{Loss}
+  # hist4 :: Vector{Loss}
+end
+
 function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, features_histograms, leaf_is)
 
   # println((length(leaf_is), length(feature_is_to_compute)))
@@ -1526,6 +1639,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
   # Cache-optimal chunk sizes for root and others, chosen by search.
   # is_chunk_size = 8704
   is_chunk_size = isa(leaf_is, UnitRange) ? 8704 : 40448
+  # is_chunk_size = isa(leaf_is, UnitRange) ? 64*64*64 : 64*64*64
     # if isa(leaf_is, UnitRange)
     #   8704
     # else
@@ -1542,14 +1656,18 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
 
   # start_time = time_ns()
 
+
   parallel_iterate(length(feature_is_to_compute)) do thread_range
+    hists = Hists([],[],[])
 
     for chunk_feature_ii in thread_range.start:features_chunk_size:thread_range.stop
       chunk_feature_is_to_compute = view(feature_is_to_compute, chunk_feature_ii:min(chunk_feature_ii+features_chunk_size-1, thread_range.stop))
 
       for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
         # for feature_ii in 1:length(chunk_feature_is_to_compute) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
-        for feature_ii in 1:2:(length(chunk_feature_is_to_compute)-1) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
+        # for feature_ii in 1:2:(length(chunk_feature_is_to_compute)-1) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
+        stride = 3
+        for feature_ii in 1:stride:(length(chunk_feature_is_to_compute)-stride+1) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
 
           # Σ∇losses     = features_histograms[feature_i].Σ∇losses
           # Σ∇∇losses    = features_histograms[feature_i].Σ∇∇losses
@@ -1558,13 +1676,26 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
           # Always 171GB of X_binned loading (unavoidable)
           # feature_i = chunk_feature_is_to_compute[feature_ii]
           # build_histogram_unrolled!(X_binned, feature_i, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i])
+          # feature_i1 = chunk_feature_is_to_compute[feature_ii]
+          # feature_i2 = chunk_feature_is_to_compute[feature_ii+1]
+          # build_2histograms_unrolled!(X_binned, feature_i1, feature_i2, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i1], features_histograms[feature_i2])
           feature_i1 = chunk_feature_is_to_compute[feature_ii]
           feature_i2 = chunk_feature_is_to_compute[feature_ii+1]
-          build_2histograms_unrolled!(X_binned, feature_i1, feature_i2, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i1], features_histograms[feature_i2])
+          feature_i3 = chunk_feature_is_to_compute[feature_ii+2]
+          # feature_i4 = chunk_feature_is_to_compute[feature_ii+3]
+          hists.hist1 = features_histograms[feature_i1]
+          hists.hist2 = features_histograms[feature_i2]
+          hists.hist3 = features_histograms[feature_i3]
+          # hists.hist4 = features_histograms[feature_i4]
+          build_3histograms_unrolled!(X_binned, feature_i1, feature_i2, feature_i3, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), hists)
         end
 
-        if isodd(length(chunk_feature_is_to_compute))
-          feature_i = last(chunk_feature_is_to_compute)
+        first_ii_unprocessed = 1 + stride*length(1:stride:(length(chunk_feature_is_to_compute)-stride+1))
+
+        # if isodd(length(chunk_feature_is_to_compute))
+        #   feature_i = last(chunk_feature_is_to_compute)
+        for feature_ii in first_ii_unprocessed:length(chunk_feature_is_to_compute)
+          feature_i = chunk_feature_is_to_compute[feature_ii]
           build_histogram_unrolled!(X_binned, feature_i, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i])
         end
       end
