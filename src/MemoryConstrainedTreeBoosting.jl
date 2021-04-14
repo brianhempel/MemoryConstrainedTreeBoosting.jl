@@ -764,7 +764,7 @@ end
 
 function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
-  if weights == nothing
+  if isnothing(weights)
     weights = ones(DataWeight, length(y))
   end
 
