@@ -1437,13 +1437,13 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1)
     feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1)
 
-    feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
-    feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
-
     # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i)
     SIMD.vstorea(feat1_bin + loss_info1, histogram1, feat1_bin_i1)
     SIMD.vstorea(feat2_bin + loss_info1, histogram2, feat2_bin_i1)
     # SIMD.vstorea(feat3_bin + loss_info, histogram3, feat3_bin_i)
+
+    feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
+    feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
 
     feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i2)
     feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i2)
@@ -1511,7 +1511,7 @@ end
 # = 7 seconds
 
 # But the limiter is probably the dependency between points: can't load a new bin until the first is saved.
-# load (4) + add (3) + store... 5 cycles => 48 seconds
+# load (4) + add (3) + store... 7 cycles => 48 seconds
 
 # ProfileHRRR.jl: 39.7s before reordering
 # ProfileHRRR.jl: 38.2s minor reordering
