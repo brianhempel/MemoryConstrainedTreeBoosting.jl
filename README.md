@@ -2,6 +2,8 @@
 
 Fast, gradient-boosted decision trees when you want to use all the memory on your machine. Only binary classification with logloss on `Float32` data is supported right now.
 
+Powers [nadocast.com](http://nadocast.com).
+
 ## Quickstart
 
 The package isn't published yet—you'll have to [point to Github](https://pkgdocs.julialang.org/v1/managing-packages/#Adding-unregistered-packages).
