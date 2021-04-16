@@ -1554,7 +1554,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
   # Should also choose chunk size by whether we are using all the features
   # (Prefetcher may perform better when we are)
   # Below is chosen at feature_fraction of 0.6
-  is_chunk_size = isa(leaf_is, UnitRange) ? 128384 : 8320
+  is_chunk_size = isa(leaf_is, UnitRange) ? 20736 : 320
   # is_chunk_size = isa(leaf_is, UnitRange) ? 64*64*64 : 64*64*64
     # if isa(leaf_is, UnitRange)
     #   8704
@@ -1565,7 +1565,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
     #   Int64(round(pts_per_∇losses_cache_line * cache_lines / 4)) # That 85k needs to be shared over 3 arrays: ∇losses_∇∇losses_weights
     # end
 
-  features_chunk_size = 32
+  features_chunk_size = 12
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses_∇∇losses_weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it

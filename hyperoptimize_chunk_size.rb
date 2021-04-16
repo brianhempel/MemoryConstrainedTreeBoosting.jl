@@ -49,7 +49,7 @@ puts "Best chunk size 2: #{best_chunk_size_2}"
 
 bench_chunk_sizes(best_chunk_size_1, best_chunk_size_2)
 
-best_feature_chunk_size = [4,8,12,16,24,32,48,64,96,128,192,256,384,512,768,1024].min_by do |chunk_size|
+best_feature_chunk_size = [4,6,8,10,12,16,24,32,48,64,96,128,192,256,384,512,768,1024].min_by do |chunk_size|
   bench_feature_chunk_size(chunk_size)
 end
 
