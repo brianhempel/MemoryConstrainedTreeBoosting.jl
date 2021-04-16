@@ -35,13 +35,13 @@ end
 # bench_chunk_sizes(8704, 448)
 # bench_chunk_sizes(8704, 448)
 
-best_chunk_size_1 = (-25..12).map(&:to_chunk_size).min_by do |chunk_size|
+best_chunk_size_1 = (-20..10).map(&:to_chunk_size).min_by do |chunk_size|
   bench_chunk_sizes(chunk_size, 8704)
 end
 
 puts "Best chunk size 1: #{best_chunk_size_1}"
 
-best_chunk_size_2 = (-25..12).map(&:to_chunk_size).min_by do |chunk_size|
+best_chunk_size_2 = (-20..10).map(&:to_chunk_size).min_by do |chunk_size|
   bench_chunk_sizes(best_chunk_size_1, chunk_size)
 end
 
