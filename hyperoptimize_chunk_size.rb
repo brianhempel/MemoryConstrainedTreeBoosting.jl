@@ -25,7 +25,7 @@ end
 
 class Integer
   def to_chunk_size
-    (10000.0*(1.15**self) / 64).round * 64
+    (10000.0*(1.2**self) / 64).round * 64
   end
 end
 
