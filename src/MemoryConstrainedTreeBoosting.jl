@@ -1524,16 +1524,39 @@ end
 # / 16 cores
 # = 10 seconds
 
+# Sandy Bridge has only one memory write port, so that is also a possible limiter.
+# ~2 passes over the data
+# * 170,000,000,000 feature-datapoints
+# * 1 write/each
+# / 1 write per cycle (Sandy Bridge)
+# / 3,100,000,000 cycles per second
+# / 16 cores
+# = 7 seconds
+
+# Per Agner Fog "Memory operations of 128 bits or less have a throughput of two reads or one read and one
+# write per clock cycle. It is not possible to do two reads and one write per clock cycle
+# because there are only two address calculation units (port 2 and 3). "
+# So:
+# ~2 passes over the data
+# * 170,000,000,000 feature-datapoints
+# * (3 reads + 1 write)/each
+# / 2 mem ops per cycle (Sandy Bridge)
+# / 3,100,000,000 cycles per second
+# / 16 cores
+# = 14 seconds
+
 # ~2 passes over the data
 # * 170GB
 # / 50GB/s DRAM bandwidth
 # = 7 seconds
 
-# But the limiter is probably the dependency between points: can't load a new bin until the first is saved.
-# load (4) + add (3) + store... 7 cycles => 48 seconds
+# Agner Fog: "Each consecutive 128 bytes, or two cache lines, in the data cache is divided into 8 banks of
+# 16 bytes each. It is not possible to do two memory reads in the same clock cycle if the two
+# memory addresses have the same bank number, i.e. if bit 4 - 6 in the two addresses are
+# the same.
+# In addition, there is a false dependence between memory addresses with the same set and
+# offset, i.e. with a distance that is a multiple of 4 Kbytes."
 
-# ProfileHRRR.jl: 39.7s before reordering
-# ProfileHRRR.jl: 38.2s minor reordering
 
 mutable struct Hists
   hist1 :: Vector{Loss}
