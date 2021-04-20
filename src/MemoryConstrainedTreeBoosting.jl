@@ -29,6 +29,29 @@ function parallel_iterate(f, count)
   end
 end
 
+# f should be a function that take an element of chunks and returns a tuple of reduction values
+#
+# parallel_iterate will unzip those tuples into a tuple of arrays of reduction values and return that.
+function parallel_iterate_work_stealing(f, chunks)
+  thread_results = Vector{Any}(undef, length(chunks))
+
+  chunk_ii = Threads.Atomic{Int}(1)
+
+  Threads.@threads for thread_i in 1:Threads.nthreads()
+    while (my_chunk_ii = Threads.atomic_add!(chunk_ii, 1)) <= length(chunks)
+      thread_results[my_chunk_ii] = f(chunks[my_chunk_ii])
+    end
+  end
+
+  if isa(thread_results[1], Tuple)
+    # Mangling so you get a tuple of arrays.
+    Tuple(collect.(zip(thread_results...)))
+  else
+    thread_results
+  end
+end
+
+
 function parallel_map!(f, out, in)
   @assert length(out) == length(in)
   Threads.@threads for i in 1:length(in)
@@ -1505,8 +1528,29 @@ end
 
 # After:
 
-# Profile.jl: 39.7s (19% faster)
-# ProfileHRRR.jl: 38.3s (25% faster)
+# $ sudo perf stat -B -a -d sleep 300
+#
+#  Performance counter stats for 'system wide':
+#
+#       9,601,957.53 msec cpu-clock                 #   31.998 CPUs utilized
+#          2,512,022      context-switches          #    0.262 K/sec
+#             12,059      cpu-migrations            #    0.001 K/sec
+#        133,044,287      page-faults               #    0.014 M/sec
+# 11,970,602,809,273      cycles                    #    1.247 GHz                      (40.00%)
+# 15,583,206,900,105      stalled-cycles-frontend   #  130.18% frontend cycles idle     (50.00%)
+# 12,580,741,772,405      stalled-cycles-backend    #  105.10% backend cycles idle      (50.00%)
+# 12,498,886,008,654      instructions              #    1.04  insn per cycle
+#                                                   #    1.25  stalled cycles per insn  (60.00%)
+#    670,570,842,271      branches                  #   69.837 M/sec                    (60.00%)
+#      5,016,108,242      branch-misses             #    0.75% of all branches          (60.00%)
+#  6,087,732,201,293      L1-dcache-loads           #  634.009 M/sec                    (33.82%)
+#    311,332,643,953      L1-dcache-load-misses     #    5.11% of all L1-dcache hits    (32.97%)
+#     76,864,890,325      LLC-loads                 #    8.005 M/sec                    (20.00%)
+#     41,446,103,665      LLC-load-misses           #   53.92% of all LL-cache hits     (30.00%)
+#
+#      300.077780575 seconds time elapsed
+
+# Hmmm, not using all threads all the time...try work stealing?
 
 # what's the limiter?
 # per feature-datapoint we must do the following if processing one feature at a time:
@@ -1590,48 +1634,52 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
 
   features_chunk_size = 12
 
+
+  features_chunk_size = clamp(Int64(floor(length(feature_is_to_compute) / Threads.nthreads())), 1, features_chunk_size)
+
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses_∇∇losses_weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
 
   # start_time = time_ns()
 
+  chunks = 1:features_chunk_size:length(feature_is_to_compute)
 
-  parallel_iterate(length(feature_is_to_compute)) do thread_range
+  # parallel_iterate(length(feature_is_to_compute)) do thread_range
+  parallel_iterate_work_stealing(chunks) do chunk_feature_ii_start
     hists = Hists([],[],[])
 
-    for chunk_feature_ii in thread_range.start:features_chunk_size:thread_range.stop
-      chunk_feature_is_to_compute = view(feature_is_to_compute, chunk_feature_ii:min(chunk_feature_ii+features_chunk_size-1, thread_range.stop))
+    chunk_feature_ii_stop = min(chunk_feature_ii_start + features_chunk_size - 1, length(feature_is_to_compute))
 
-      for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
-        # for feature_ii in 1:length(chunk_feature_is_to_compute) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
-        # for feature_ii in 1:2:(length(chunk_feature_is_to_compute)-1) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
-        feature_ii = 1
-        while feature_ii <= length(chunk_feature_is_to_compute)
+    for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
+      # for feature_ii in 1:length(chunk_feature_is_to_compute) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
+      # for feature_ii in 1:2:(length(chunk_feature_is_to_compute)-1) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
+      feature_ii = chunk_feature_ii_start
+      while feature_ii <= chunk_feature_ii_stop
 
-          # Always 171GB of X_binned loading (unavoidable)
-          if feature_ii + 2 <= length(chunk_feature_is_to_compute)
-            feature_i1 = chunk_feature_is_to_compute[feature_ii]
-            feature_i2 = chunk_feature_is_to_compute[feature_ii+1]
-            feature_i3 = chunk_feature_is_to_compute[feature_ii+2]
-            # feature_i4 = chunk_feature_is_to_compute[feature_ii+3]
-            hists.hist1 = features_histograms[feature_i1]
-            hists.hist2 = features_histograms[feature_i2]
-            hists.hist3 = features_histograms[feature_i3]
-            # hists.hist4 = features_histograms[feature_i4]
-            build_3histograms_unrolled!(X_binned, feature_i1, feature_i2, feature_i3, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), hists)
-            feature_ii += 3
-          elseif feature_ii + 1 <= length(chunk_feature_is_to_compute)
-            feature_i1 = chunk_feature_is_to_compute[feature_ii]
-            feature_i2 = chunk_feature_is_to_compute[feature_ii+1]
-            build_2histograms_unrolled!(X_binned, feature_i1, feature_i2, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i1], features_histograms[feature_i2])
-            feature_ii += 2
-          else
-            feature_i = chunk_feature_is_to_compute[feature_ii]
-            build_histogram_unrolled!(X_binned, feature_i, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i])
-            feature_ii += 1
-          end
+        # Always 171GB of X_binned loading (unavoidable)
+        if feature_ii + 2 <= chunk_feature_ii_stop
+          feature_i1 = feature_is_to_compute[feature_ii]
+          feature_i2 = feature_is_to_compute[feature_ii+1]
+          feature_i3 = feature_is_to_compute[feature_ii+2]
+          # feature_i4 = feature_is_to_compute[feature_ii+3]
+          hists.hist1 = features_histograms[feature_i1]
+          hists.hist2 = features_histograms[feature_i2]
+          hists.hist3 = features_histograms[feature_i3]
+          # hists.hist4 = features_histograms[feature_i4]
+          build_3histograms_unrolled!(X_binned, feature_i1, feature_i2, feature_i3, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), hists)
+          feature_ii += 3
+        elseif feature_ii + 1 <= chunk_feature_ii_stop
+          feature_i1 = feature_is_to_compute[feature_ii]
+          feature_i2 = feature_is_to_compute[feature_ii+1]
+          build_2histograms_unrolled!(X_binned, feature_i1, feature_i2, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i1], features_histograms[feature_i2])
+          feature_ii += 2
+        else
+          feature_i = feature_is_to_compute[feature_ii]
+          build_histogram_unrolled!(X_binned, feature_i, ∇losses_∇∇losses_weights, leaf_is, ii, min(ii+is_chunk_size-1, length(leaf_is)), features_histograms[feature_i])
+          feature_ii += 1
         end
       end
+
       ()
     end
 
