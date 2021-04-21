@@ -135,11 +135,6 @@ function _parallel_partition!(trues, falses, trues_end_indicies, falses_end_indi
   ()
 end
 
-struct Const
-  x
-end
-Base.getindex(c::Const, i::Int) = c.x
-
 
 default_config = (
   weights                            = nothing, # weights for the data
@@ -753,6 +748,39 @@ end
 
 index_type(array) = length(array) < typemax(UInt32) ? UInt32 : Int64
 
+mutable struct ScratchHistograms
+  next_free_i :: Threads.Atomic{Int64}
+  histograms  :: Vector{Vector{Loss}}
+
+  ScratchHistograms(X_binned; config...) = begin
+    features_to_use_count = Int(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+    histogram_count = features_to_use_count * min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
+    histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
+    histograms = map(_ -> resize!(Vector{Loss}(undef, histogram_size), 4*max_bins), 1:histogram_count)
+
+    new(Threads.Atomic{Int64}(1), histograms)
+  end
+end
+
+function reset_scratch_histograms(scratch_histograms :: ScratchHistograms)
+  Threads.atomic_xchg!(scratch_histograms.next_free_i, 1)
+  scratch_histograms
+end
+
+function next_free_histogram(scratch_histograms :: ScratchHistograms)
+  free_i = Threads.atomic_add!(scratch_histograms.next_free_i, 1)
+  histogram =
+    if free_i <= length(scratch_histograms.histograms)
+      scratch_histograms.histograms[free_i]
+    else
+      println("WARNING: Math off: should never need to allocate new histograms")
+      histogram_size  = 4*max_bins + Int(64/sizeof(Loss))
+      resize!(Vector{Loss}(undef, histogram_size), 4*max_bins)
+    end
+
+  fill!(histogram, Loss(0))
+end
+
 # Reusable memory to avoid allocations between trees.
 mutable struct ScratchMemory
   ∇losses_∇∇losses_weights :: Vector{Loss}
@@ -763,17 +791,23 @@ mutable struct ScratchMemory
   is       :: Union{Vector{UInt32},Vector{Int64}}
   trues    :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
   falses   :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
+  scratch_histograms :: ScratchHistograms
 
-  ScratchMemory(y) =
+  ScratchMemory(X_binned, y; config...) = begin
+    histogram_count = min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
+    histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
+
     new(
-      Vector{Loss}(undef, length(y)*4),
-      Vector{Loss}(undef, length(y)*2),
+      Vector{Loss}(undef, data_count(X_binned)*4),
+      Vector{Loss}(undef, data_count(X_binned)*2),
       # Vector{Loss}(undef, length(y)),
       # get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(y)) : nothing,
-      Vector{index_type(y)}(undef, length(y)),
-      Vector{index_type(y)}(undef, length(y)),
-      Vector{index_type(y)}(undef, length(y)),
+      Vector{index_type(y)}(undef, data_count(X_binned)),
+      Vector{index_type(y)}(undef, data_count(X_binned)),
+      Vector{index_type(y)}(undef, data_count(X_binned)),
+      ScratchHistograms(X_binned; config...)
     )
+  end
 end
 
 function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
@@ -795,7 +829,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   trees = copy(prior_trees)
 
-  scratch_memory = ScratchMemory(y)
+  scratch_memory = ScratchMemory(X_binned, y; config...)
 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
@@ -837,7 +871,10 @@ end
 
 
 # Returns new tree
-function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = ScratchMemory(y), config...) :: Tree
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, config...) :: Tree
+  if isnothing(scratch_memory)
+    scratch_memory = ScratchMemory(X_binned, y, config...)
+  end
   learning_rate       = Score(get_config_field(config, :learning_rate))
   bagging_temperature = DataWeight(get_config_field(config, :bagging_temperature))
 
@@ -849,12 +886,14 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   is       = scratch_memory.is
   trues    = scratch_memory.trues
   falses   = scratch_memory.falses
+  scratch_histograms = scratch_memory.scratch_histograms
+  reset_scratch_histograms(scratch_histograms)
 
   compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights)
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weights)
 
-  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses; config...)
+  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
@@ -892,7 +931,7 @@ function bagged_weights!(weights, bagging_temperature, out)
   ()
 end
 
-function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses; config...)
+function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
   tree =
@@ -907,6 +946,7 @@ function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇los
 
   features_to_use_count = UInt32(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
 
+  # This still allocates :/
   # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
   feature_is = sort(Random.shuffle(UInt32(1):UInt32(feature_count(X_binned)))[1:features_to_use_count])
 
@@ -916,7 +956,7 @@ function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇los
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; config...)
   end
 
   tree
@@ -949,11 +989,22 @@ function compute_mean_probability(y, weights)
 end
 
 function compute_mean_logloss(y, scores, weights = nothing)
-  weights = isnothing(weights) ? Const(one(DataWeight)) : weights
   _compute_mean_logloss(y, scores, weights)
 end
 
-function _compute_mean_logloss(y, scores, weights)
+function _compute_mean_logloss(y, scores, weights :: Nothing)
+  thread_Σlosses = parallel_iterate(length(y)) do thread_range
+    Σloss   = zero(Loss)
+    @inbounds for i in thread_range
+      ŷ_i      = σ(scores[i])
+      Σloss   += logloss(y[i], ŷ_i)
+    end
+    Σloss
+  end
+  sum(thread_Σlosses) / length(y)
+end
+
+function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
   # Broadcast version, which performs allocations:
   # ŷ = σ.(scores)
   # mean_logloss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
@@ -1054,7 +1105,9 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses; config...)
+function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; config...)
+
+  # This still allocates :/
   leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
 
   if length(leaves) >= get_config_field(config, :max_leaves)
@@ -1097,7 +1150,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
 
         if !isempty(feature_is_to_compute)
           Threads.@threads for feature_i in feature_is_to_compute
-            leaf.features_histograms[feature_i] = zeros(Loss, max_bins*4)
+            leaf.features_histograms[feature_i] = next_free_histogram(scratch_histograms)
           end
 
           # println(@code_llvm compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, leaf.features_histograms, leaf.is))
@@ -1161,6 +1214,9 @@ end
 # Returns the parent_histogram mutated into the second sibling
 function convert_parent_to_second_sibling_histogram!(parent_histogram, sibling_histogram)
   parent_histogram .-= sibling_histogram
+  # @inbounds @simd for i in 1:length(parent_histogram)
+  #   parent_histogram[i] -= sibling_histogram[i]
+  # end
   parent_histogram
 end
 
@@ -1543,6 +1599,33 @@ end
 
 # Hmmm, not using all threads all the time...try work stealing?
 
+# After work stealing:
+
+# $ sudo perf stat -B -a -d sleep 300
+#
+#  Performance counter stats for 'system wide':
+#
+#       9,600,901.95 msec cpu-clock                 #   31.998 CPUs utilized
+#          2,770,768      context-switches          #    0.289 K/sec
+#              8,814      cpu-migrations            #    0.001 K/sec
+#         17,590,617      page-faults               #    0.002 M/sec
+# 17,040,666,272,115      cycles                    #    1.775 GHz                      (38.44%)
+# 14,920,973,369,568      stalled-cycles-frontend   #   87.56% frontend cycles idle     (48.44%)
+#  9,007,863,366,220      stalled-cycles-backend    #   52.86% backend cycles idle      (50.00%)
+# 16,201,076,017,964      instructions              #    0.95  insn per cycle
+#                                                   #    0.92  stalled cycles per insn  (60.00%)
+#    769,258,226,952      branches                  #   80.124 M/sec                    (60.00%)
+#      5,054,113,485      branch-misses             #    0.66% of all branches          (60.00%)
+#  8,178,126,773,570      L1-dcache-loads           #  851.808 M/sec                    (31.61%)
+#    444,386,110,419      L1-dcache-load-misses     #    5.43% of all L1-dcache hits    (33.47%)
+#     99,783,974,790      LLC-loads                 #   10.393 M/sec                    (20.00%)
+#     46,342,683,050      LLC-load-misses           #   46.44% of all LL-cache hits     (28.44%)
+#
+#      300.050504689 seconds time elapsed
+#
+# Still need to get GC to run less, I think. It's single-threaded.
+#
+
 # what's the limiter?
 # per feature-datapoint we must do the following if processing one feature at a time:
 # 1. 1 load to get the feature (there may be a fancy way to consolidate this when the data is dense)
@@ -1669,9 +1752,18 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
 
   chunks = 1:features_chunk_size:length(feature_is_to_compute)
 
+  # We'll re-allocate these in threads to be sure they are on different cache lines.
+  histss = Union{Hists,Nothing}[]
+  for i in 1:Threads.nthreads()
+    push!(histss, nothing)
+  end
+
   # parallel_iterate(length(feature_is_to_compute)) do thread_range
   parallel_iterate_work_stealing(chunks) do chunk_feature_ii_start
-    hists = Hists([],[],[])
+    if isnothing(histss[Threads.threadid()])
+      histss[Threads.threadid()] = Hists([],[],[])
+    end
+    hists = histss[Threads.threadid()]
 
     chunk_feature_ii_stop = min(chunk_feature_ii_start + features_chunk_size - 1, length(feature_is_to_compute))
 
