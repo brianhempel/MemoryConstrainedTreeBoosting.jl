@@ -322,17 +322,12 @@ end
 function print_tree(tree, level = 0; feature_i_to_name = nothing)
   indentation = repeat("    ", level)
   if isa(tree, Node)
-    feature_name =
-      if feature_i_to_name != nothing
-        feature_i_to_name(tree.feature_i)
-      else
-        "feature $(tree.feature_i)"
-      end
+    feature_name = isnothing(feature_i_to_name) ? "feature $(tree.feature_i)" : feature_i_to_name(tree.feature_i)
     println(indentation * "$feature_name\tsplit at $(tree.split_i)")
     print_tree(tree.left,  level + 1, feature_i_to_name = feature_i_to_name)
     print_tree(tree.right, level + 1, feature_i_to_name = feature_i_to_name)
   else
-    println(indentation * "Δscore $(tree.Δscore)\t$(length(tree.is)) datapoints")
+    println(indentation * "Δscore $(tree.Δscore)")
   end
 end
 
