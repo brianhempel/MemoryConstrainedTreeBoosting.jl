@@ -936,7 +936,7 @@ end
 function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
-  max_data_count_on_single_machine = mpi_max_i64(mpi_comm, length(all_is))
+  max_data_count_on_single_machine = mpi_max(mpi_comm, length(all_is))
   tree =
     Leaf(
       sum_optimal_Δscore(llw_∇losses(∇losses_∇∇losses_weights), llw_∇∇losses(∇losses_∇∇losses_weights), Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
@@ -986,17 +986,17 @@ function mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf_features_hist
   end
 end
 
-function mpi_max_i64(comm, x)
+function mpi_max(comm, x)
   isnothing(comm) ? x : MPI.Allreduce(x, max, comm)
 end
 
-function mpi_sum_f32(comm, xs...)
-  isnothing(comm) ? xs : MPI.Allreduce(Float32[xs...], +, comm)
+function mpi_sum(comm, xs...)
+  isnothing(comm) ? xs : MPI.Allreduce([xs...], +, comm)
 end
 
-function mpi_mean_f32(comm, my_Σ, my_weight)
+function mpi_mean(comm, my_Σ, my_weight)
   # thank you to time 5:06 of https://www.youtube.com/watch?v=pV-8YqfOxQE
-  Σ, weight = mpi_sum_f32(comm, my_Σ, my_weight)
+  Σ, weight = mpi_sum(comm, my_Σ, my_weight)
   Σ / weight
 end
 
@@ -1016,12 +1016,12 @@ function compute_mean_probability(y, weights; mpi_comm = nothing)
     end
     (Σlabel, Σweight)
   end
-  mpi_mean_f32(mpi_comm, sum(thread_Σlabels), sum(thread_Σweight))
+  mpi_mean(mpi_comm, sum(thread_Σlabels), sum(thread_Σweight))
 end
 
 function compute_mean_logloss(y, scores; weights = nothing, mpi_comm = nothing)
   Σlosses, Σweights =  _compute_mean_logloss(y, scores, weights)
-  mpi_mean_f32(mpi_comm, Σlosses, Σweights)
+  mpi_mean(mpi_comm, Σlosses, Σweights)
 end
 
 function _compute_mean_logloss(y, scores, weights :: Nothing)
@@ -1104,7 +1104,7 @@ end
 # Assuming binary classification with log loss.
 function sum_optimal_Δscore(∇losses :: AbstractArray{Loss}, ∇∇losses :: AbstractArray{Loss}, l2_regularization :: Loss, max_delta_score :: Score; mpi_comm = nothing)
   Σ∇loss, Σ∇∇loss = sum_∇loss_∇∇loss(∇losses, ∇∇losses)
-  Σ∇loss, Σ∇∇loss = mpi_sum_f32(mpi_comm, Σ∇loss, Σ∇∇loss)
+  Σ∇loss, Σ∇∇loss = mpi_sum(mpi_comm, Σ∇loss, Σ∇∇loss)
 
   optimal_Δscore(Σ∇loss, Σ∇∇loss, l2_regularization, max_delta_score)
 end
@@ -1234,8 +1234,8 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
 
     left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, trues, falses, leaf_to_split.is)
 
-    left_leaf  = Leaf(split_candidate.left_Δscore,  left_is,  mpi_max_i64(mpi_comm, length(left_is)),  split_candidate.left_data_weight,  nothing, [])
-    right_leaf = Leaf(split_candidate.right_Δscore, right_is, mpi_max_i64(mpi_comm, length(right_is)), split_candidate.right_data_weight, nothing, [])
+    left_leaf  = Leaf(split_candidate.left_Δscore,  left_is,  mpi_max(mpi_comm, length(left_is)),  split_candidate.left_data_weight,  nothing, [])
+    right_leaf = Leaf(split_candidate.right_Δscore, right_is, mpi_max(mpi_comm, length(right_is)), split_candidate.right_data_weight, nothing, [])
 
     # left_leaf, right_leaf = make_split_leaves(feature_binned, ∇losses_∇∇losses_weights, leaf_to_split.maybe_data_weight, split_i, scratch_is, trues, falses, leaf_to_split.is, l2_regularization, max_delta_score)
 
