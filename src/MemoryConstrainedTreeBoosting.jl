@@ -7,6 +7,8 @@ import Random
 import BSON
 import SIMD
 
+using MPI
+
 
 # f should be a function that take an indices_range and returns a tuple of reduction values
 #
@@ -188,7 +190,7 @@ get_feature(X_binned :: Data, feature_i) = @view X_binned[:, feature_i]
 
 abstract type Tree end
 
-mutable struct SplitCandidate
+mutable struct SplitCandidate # When running on multiple machines, these should always be the global stats.
   expected_Δloss    :: Loss
   feature_i         :: Int64
   split_i           :: UInt8
@@ -229,13 +231,14 @@ mutable struct Node <: Tree
 end
 
 mutable struct Leaf <: Tree
-  Δscore                :: Score # Called "weight" in the literature
-  is                                                        # Transient. Needed during tree growing.
-  maybe_data_weight     :: Union{DataWeight,Nothing}        # Transient. Needed during tree growing.
-  maybe_split_candidate :: Union{SplitCandidate,Nothing}    # Transient. Needed during tree growing.
-  features_histograms   :: Vector{Union{Histogram,Nothing}} # Transient. Used to speed up tree calculation.
+  Δscore                           :: Score                            # Called "weight" in the literature
+  is                                                                   # Transient. Needed during tree growing.
+  max_data_count_on_single_machine :: Union{Int64,Nothing}             # Transient. Needed during tree growing across multiple machines, so each machine splits leaves in the same order.
+  maybe_data_weight                :: Union{DataWeight,Nothing}        # Transient. Needed during tree growing.
+  maybe_split_candidate            :: Union{SplitCandidate,Nothing}    # Transient. Needed during tree growing.
+  features_histograms              :: Vector{Union{Histogram,Nothing}} # Transient. Used to speed up tree calculation.
 
-  Leaf(Δscore, is = nothing, maybe_data_weight = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, maybe_data_weight, maybe_split_candidate, features_histograms)
+  Leaf(Δscore, is = nothing, max_data_count_on_single_machine = nothing, maybe_data_weight = nothing, maybe_split_candidate = nothing, features_histograms = []) = new(Δscore, is, max_data_count_on_single_machine, maybe_data_weight, maybe_split_candidate, features_histograms)
 end
 
 # For use in a list; right_i and left_i are indices into the list. feature_i == -1 for leaves.
@@ -447,7 +450,7 @@ function strip_tree_training_info(tree) :: Tree
     right = strip_tree_training_info(tree.right)
     Node(tree.feature_i, tree.split_i, left, right, [])
   else
-    Leaf(tree.Δscore, nothing, nothing, nothing, [])
+    Leaf(tree.Δscore, nothing, nothing, nothing, nothing, [])
   end
 end
 
@@ -584,7 +587,7 @@ end
 
 # Aim for a roughly equal number of data points in each bin.
 # Does not support weights.
-function prepare_bin_splits(X :: Array{FeatureType,2}, bin_count = 255) :: Vector{BinSplits{FeatureType}} where FeatureType <: AbstractFloat
+function prepare_bin_splits(X :: Array{FeatureType,2}; bin_count = 255) :: Vector{BinSplits{FeatureType}} where FeatureType <: AbstractFloat
   if bin_count < 2 || bin_count > 255
     error("prepare_bin_splits: bin_count must be between 2 and 255")
   end
@@ -662,7 +665,7 @@ struct EarlyStop <: Exception
 end
 
 # Note the returned closure is stateful (need to remake the iteration callback for new runs).
-function make_callback_to_track_validation_loss(validation_X_binned, validation_y; validation_weights = nothing, max_iterations_without_improvement = typemax(Int64))
+function make_callback_to_track_validation_loss(validation_X_binned, validation_y; validation_weights = nothing, max_iterations_without_improvement = typemax(Int64), mpi_comm = nothing)
   validation_scores              = nothing
   best_loss                      = Loss(Inf)
   iterations_without_improvement = 0
@@ -678,7 +681,7 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
     else
       apply_tree!(validation_X_binned, new_tree, validation_scores)
     end
-    validation_loss = compute_mean_logloss(validation_y, validation_scores, validation_weights)
+    validation_loss = compute_mean_logloss(validation_y, validation_scores; weights = validation_weights, mpi_comm = mpi_comm)
 
     if validation_loss < best_loss
       best_loss                      = validation_loss
@@ -690,7 +693,9 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
         throw(EarlyStop())
       end
     end
-    print("\rBest validation loss: $best_loss    ")
+    if isnothing(mpi_comm) || mpi_comm == 0
+      print("\rBest validation loss: $best_loss    ")
+    end
 
     validation_loss
   end
@@ -702,7 +707,7 @@ end
 function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
   if bin_splits == nothing
     print("Preparing bin splits...")
-    bin_splits = prepare_bin_splits(X, get_config_field(config, :bin_count))
+    bin_splits = prepare_bin_splits(X; bin_count = get_config_field(config, :bin_count))
     println("done.")
   end
   # println(bin_splits)
@@ -805,7 +810,7 @@ mutable struct ScratchMemory
   end
 end
 
-function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: Vector{Tree}
+function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], mpi_comm = nothing, config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
   if isnothing(weights)
     weights = ones(DataWeight, length(y))
@@ -813,9 +818,11 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
 
   if isempty(prior_trees)
     initial_score = begin
-      probability = compute_mean_probability(y, weights)
+      probability = compute_mean_probability(y, weights, mpi_comm = mpi_comm)
       log(probability / (1-probability)) # inverse sigmoid
     end
+
+    # print("$initial_score\n")
 
     prior_trees = Tree[Leaf(initial_score)]
   end
@@ -829,7 +836,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], config...) :: 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
       duration = @elapsed begin
-        tree = train_one_iteration(X_binned, y, weights, scores; scratch_memory = scratch_memory, config...)
+        tree = train_one_iteration(X_binned, y, weights, scores; scratch_memory = scratch_memory, mpi_comm = mpi_comm, config...)
         tree = strip_tree_training_info(tree) # For long boosting sessions, should save memory if we strip off the list of indices
         apply_tree!(X_binned, tree, scores)
 
@@ -866,7 +873,7 @@ end
 
 
 # Returns new tree
-function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, config...) :: Tree
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, mpi_comm = nothing, config...) :: Tree
   if isnothing(scratch_memory)
     scratch_memory = ScratchMemory(X_binned, y, config...)
   end
@@ -888,7 +895,7 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weights)
 
-  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; config...)
+  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = mpi_comm, config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
@@ -926,14 +933,15 @@ function bagged_weights!(weights, bagging_temperature, out)
   ()
 end
 
-function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; config...)
+function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
+  max_data_count_on_single_machine = mpi_max_i64(mpi_comm, length(all_is))
   tree =
     Leaf(
-      # TODO optimize
       sum_optimal_Δscore(llw_∇losses(∇losses_∇∇losses_weights), llw_∇∇losses(∇losses_∇∇losses_weights), Loss(get_config_field(config, :l2_regularization)), Score(get_config_field(config, :max_delta_score))),
       all_is,
+      max_data_count_on_single_machine,
       nothing, # maybe_data_weight
       nothing, # maybe_split_candidate
       []       # feature_histograms
@@ -943,7 +951,9 @@ function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇los
 
   # This still allocates :/
   # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
-  feature_is = sort(Random.shuffle(UInt32(1):UInt32(feature_count(X_binned)))[1:features_to_use_count])
+  feature_is = mpi_compute_on_one_and_share(mpi_comm) do
+    sort(Random.shuffle(UInt32(1):UInt32(feature_count(X_binned)))[1:features_to_use_count])
+  end
 
   tree_changed = true
 
@@ -951,7 +961,7 @@ function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇los
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = mpi_comm, config...)
   end
 
   tree
@@ -969,8 +979,34 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε)
 @inline ∇logloss(y, ŷ) = ŷ - y
 @inline ∇∇logloss(ŷ)   = ŷ * (1.0f0 - ŷ) # Interestingly, not dependent on y. XGBoost adds an ε term
 
+function mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf_features_histograms)
+  # The slow way, lots of communication.
+  for feature_i in feature_is_to_compute
+    MPI.Allreduce!(leaf_features_histograms[feature_i], +, mpi_comm)
+  end
+end
 
-function compute_mean_probability(y, weights)
+function mpi_max_i64(comm, x)
+  isnothing(comm) ? x : MPI.Allreduce(x, max, comm)
+end
+
+function mpi_sum_f32(comm, xs...)
+  isnothing(comm) ? xs : MPI.Allreduce(Float32[xs...], +, comm)
+end
+
+function mpi_mean_f32(comm, my_Σ, my_weight)
+  # thank you to time 5:06 of https://www.youtube.com/watch?v=pV-8YqfOxQE
+  Σ, weight = mpi_sum_f32(comm, my_Σ, my_weight)
+  Σ / weight
+end
+
+function mpi_compute_on_one_and_share(f, comm)
+  out = MPI.Comm_rank(comm) == 0 ? f() : nothing
+  out = MPI.bcast(out, 0, comm)
+  out
+end
+
+function compute_mean_probability(y, weights; mpi_comm = nothing)
   thread_Σlabels, thread_Σweight = parallel_iterate(length(y)) do thread_range
     Σlabel  = zero(Prediction)
     Σweight = zero(DataWeight)
@@ -980,11 +1016,12 @@ function compute_mean_probability(y, weights)
     end
     (Σlabel, Σweight)
   end
-  sum(thread_Σlabels) / sum(thread_Σweight)
+  mpi_mean_f32(mpi_comm, sum(thread_Σlabels), sum(thread_Σweight))
 end
 
-function compute_mean_logloss(y, scores, weights = nothing)
-  _compute_mean_logloss(y, scores, weights)
+function compute_mean_logloss(y, scores; weights = nothing, mpi_comm = nothing)
+  Σlosses, Σweights =  _compute_mean_logloss(y, scores, weights)
+  mpi_mean_f32(mpi_comm, Σlosses, Σweights)
 end
 
 function _compute_mean_logloss(y, scores, weights :: Nothing)
@@ -996,7 +1033,7 @@ function _compute_mean_logloss(y, scores, weights :: Nothing)
     end
     Σloss
   end
-  sum(thread_Σlosses) / length(y)
+  sum(thread_Σlosses), length(y)
 end
 
 function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
@@ -1013,7 +1050,7 @@ function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
     end
     (Σloss, Σweight)
   end
-  sum(thread_Σlosses) / sum(thread_Σweights)
+  sum(thread_Σlosses), sum(thread_Σweights)
 end
 
 # @inline llw_base_i(i) = 1+(i-1)*4
@@ -1065,8 +1102,9 @@ function compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weigh
 end
 
 # Assuming binary classification with log loss.
-function sum_optimal_Δscore(∇losses :: AbstractArray{Loss}, ∇∇losses :: AbstractArray{Loss}, l2_regularization :: Loss, max_delta_score :: Score)
+function sum_optimal_Δscore(∇losses :: AbstractArray{Loss}, ∇∇losses :: AbstractArray{Loss}, l2_regularization :: Loss, max_delta_score :: Score; mpi_comm = nothing)
   Σ∇loss, Σ∇∇loss = sum_∇loss_∇∇loss(∇losses, ∇∇losses)
+  Σ∇loss, Σ∇∇loss = mpi_sum_f32(mpi_comm, Σ∇loss, Σ∇∇loss)
 
   optimal_Δscore(Σ∇loss, Σ∇∇loss, l2_regularization, max_delta_score)
 end
@@ -1100,10 +1138,10 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; config...)
+function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
 
   # This still allocates :/
-  leaves = sort(tree_leaves(tree), by = (leaf -> length(leaf.is))) # Process smallest leaves first, should speed up histogram computation.
+  leaves = sort(tree_leaves(tree), by = (leaf -> leaf.max_data_count_on_single_machine)) # Process smallest leaves first, should speed up histogram computation.
 
   if length(leaves) >= get_config_field(config, :max_leaves)
     return (false, tree)
@@ -1115,10 +1153,10 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
 
   # Ensure split_candidate on all leaves
   for leaf in leaves
-    if leaf.maybe_split_candidate == nothing && leaf_depth(tree, leaf) >= get_config_field(config, :max_depth)
+    if isnothing(leaf.maybe_split_candidate) && leaf_depth(tree, leaf) >= get_config_field(config, :max_depth)
       leaf.maybe_split_candidate = dont_split
 
-    elseif leaf.maybe_split_candidate == nothing
+    elseif isnothing(leaf.maybe_split_candidate)
 
       leaf_too_small_to_split = !isnothing(leaf.maybe_data_weight) && leaf.maybe_data_weight < min_data_weight_in_leaf*DataWeight(2)
       maybe_sibling = sibling_node(tree, leaf)
@@ -1157,11 +1195,16 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
               ∇losses_∇∇losses_weights
             elseif length(leaf.is) <= div(data_count(X_binned),2)
               consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf.is, ∇losses_∇∇losses_weights_scratch)
+            elseif !isnothing(mpi_comm) # when data is split across multiple computers, it is possible for a "small" leaf to have more than half the data
+              ∇losses_∇∇losses_weights
             else
               throw(:leaf_is_length_should_never_be_more_than_half_the_real_total)
             end
 
           compute_histograms!(X_binned, ∇losses_∇∇losses_weights_consolidated, feature_is_to_compute, leaf.features_histograms, leaf.is)
+
+          # We only calculated the histogram for our local data. Sum with the rest of the data, so histograms are global.
+          mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf.features_histograms)
         end
 
         leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
@@ -1191,8 +1234,8 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
 
     left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, trues, falses, leaf_to_split.is)
 
-    left_leaf  = Leaf(split_candidate.left_Δscore,  left_is,  split_candidate.left_data_weight,  nothing, [])
-    right_leaf = Leaf(split_candidate.right_Δscore, right_is, split_candidate.right_data_weight, nothing, [])
+    left_leaf  = Leaf(split_candidate.left_Δscore,  left_is,  mpi_max_i64(mpi_comm, length(left_is)),  split_candidate.left_data_weight,  nothing, [])
+    right_leaf = Leaf(split_candidate.right_Δscore, right_is, mpi_max_i64(mpi_comm, length(right_is)), split_candidate.right_data_weight, nothing, [])
 
     # left_leaf, right_leaf = make_split_leaves(feature_binned, ∇losses_∇∇losses_weights, leaf_to_split.maybe_data_weight, split_i, scratch_is, trues, falses, leaf_to_split.is, l2_regularization, max_delta_score)
 

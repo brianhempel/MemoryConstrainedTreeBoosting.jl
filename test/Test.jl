@@ -53,6 +53,7 @@ validation_weights = weights[1:3]
       iteration_count = 20,
       min_data_weight_in_leaf = 2.0,
       learning_rate = 0.3,
+      bagging_temperature = 0.0,
       validation_X       = validation_X,
       validation_y       = validation_y,
       validation_weights = validation_weights

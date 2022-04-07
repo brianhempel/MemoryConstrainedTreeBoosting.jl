@@ -63,7 +63,7 @@ Load a subsample of your data, then compute the bin boundaries using `prepare_bi
 
 ````julia
 X_sample   = ... # Column major, Float32s. (Rows are data points, columns are features)
-bin_splits = prepare_bin_splits(X_sample, 255)
+bin_splits = prepare_bin_splits(X_sample, bin_count = 255)
 ````
 
 Figure out how much data you have by reading your files on disk. I'm going to hard code this for this example.
@@ -137,7 +137,6 @@ test_X_binned = apply_bins(test_X, bin_splits)
 ŷ = predict_on_binned(test_X_binned, trees)
 ```
 
+## Distributed Learning
 
-
-
-
+If your data will not fit on a single node...
