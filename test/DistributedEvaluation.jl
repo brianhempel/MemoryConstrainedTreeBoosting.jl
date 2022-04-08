@@ -137,6 +137,7 @@ duration = @elapsed train_on_binned(
   iteration_callback = iteration_callback()
 )
 
+MPI.Barrier(comm)
 if rank == root
   println()
   println("$duration seconds. Expected best validation loss: 0.2816312 (or thereabouts)")

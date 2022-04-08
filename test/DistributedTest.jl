@@ -98,6 +98,7 @@ trees = train_on_binned(
   mpi_comm                = comm,
 );
 
+MPI.Barrier(comm)
 if rank == root
   expected_ŷ_full = Float32[0.030087346, 0.9722849, 0.867269, 0.07883832, 0.07883832, 0.07883832, 0.9722849, 0.867269, 0.9722849, 0.867269]
 

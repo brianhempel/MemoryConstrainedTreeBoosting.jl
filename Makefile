@@ -21,6 +21,11 @@ distributed_test:
 	mpiexecjl -n 3 julia --project=. test/DistributedTest.jl
 	# JULIA_NUM_THREADS=${CORE_COUNT} mpiexecjl -n 3 julia --project=. test/DistributedTest.jl
 
+distributed_profile:
+	# May need to turn threads off in various functions
+	# mpiexecjl -n 1 julia --project=. test/DistributedProfile.jl
+	JULIA_NUM_THREADS=${CORE_COUNT} mpiexecjl -n 3 julia --project=. test/DistributedProfile.jl
+
 distributed_evaluation:
 	# May need to turn threads off in various functions
 	mpiexecjl -n 3 julia --project=. test/DistributedEvaluation.jl
