@@ -1328,8 +1328,7 @@ function consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weig
     leaf_ii_stop = thread_range.stop - stride + 1
     consolidate_∇losses_∇∇losses_weights_unrolled!(∇losses_∇∇losses_weights, leaf_is, thread_range.start, leaf_ii_stop, out)
 
-    first_ii_unprocessed = last(thread_range.start:stride:leaf_ii_stop) < 1 ? 1 : last(thread_range.start:stride:leaf_ii_stop) + stride
-    # first_ii_unprocessed = thread_range.start
+    first_ii_unprocessed = last(thread_range.start:stride:leaf_ii_stop) < thread_range.start ? thread_range.start : last(thread_range.start:stride:leaf_ii_stop) + stride
 
     # The last couple points...
     llw_i_out = llw_base_i(first_ii_unprocessed)
