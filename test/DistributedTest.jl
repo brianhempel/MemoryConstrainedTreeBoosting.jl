@@ -2,6 +2,8 @@
 # echo "import MPI\nMPI.install_mpiexecjl()" | julia --project=..
 #
 # $ mpiexecjl -n 3 julia --project=.. DistributedTest.jl
+#
+# This file is the MPI version of Test.jl
 
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 
@@ -16,7 +18,7 @@ root       = 0
 rank       = MPI.Comm_rank(comm)
 rank_count = MPI.Comm_size(comm)
 
-print("Hello world, I am rank $(MPI.Comm_rank(comm)) of $(MPI.Comm_size(comm))\n")
+print("Hi from rank $(MPI.Comm_rank(comm)) of $(MPI.Comm_size(comm))!\n")
 MPI.Barrier(comm)
 
 function chunk_range(chunk_i, n_chunks, array_len)
@@ -63,7 +65,7 @@ weights_full = Float32[10.0
 
 bin_splits = rank == root ? prepare_bin_splits(X_full, bin_count = 4) : nothing
 bin_splits = MPI.bcast(bin_splits, root, comm)
-
+Random.seed!(123456 + rank)
 
 # Simulate data being on different nodes
 my_chunk_range = chunk_range(rank+1,rank_count,10)
@@ -96,15 +98,17 @@ trees = train_on_binned(
   mpi_comm                = comm,
 );
 
-MPI.Barrier(comm)
 if rank == root
   expected_ŷ_full = Float32[0.030087346, 0.9722849, 0.867269, 0.07883832, 0.07883832, 0.07883832, 0.9722849, 0.867269, 0.9722849, 0.867269]
 
   println()
   ŷ_full = predict(X_full, bin_splits, trees)
-  println(ŷ_full)
-  println(expected_ŷ_full)
-  println(y_full)
+  println("           y: $(y_full)")
+  println("The following two should be the same:")
+  println("           ŷ: $(ŷ_full)")
+  println("  expected ŷ: $(expected_ŷ_full)")
+  println()
 
-  # @assert ŷ_full == expected_ŷ_full
+  @assert ŷ_full == expected_ŷ_full
 end
+

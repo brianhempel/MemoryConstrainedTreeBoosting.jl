@@ -693,9 +693,7 @@ function make_callback_to_track_validation_loss(validation_X_binned, validation_
         throw(EarlyStop())
       end
     end
-    if isnothing(mpi_comm) || mpi_comm == 0
-      print("\rBest validation loss: $best_loss    ")
-    end
+    mpi_print(mpi_comm, "\rBest validation loss: $best_loss    ")
 
     validation_loss
   end
@@ -853,10 +851,10 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], mpi_comm = not
           get_config_field(config, :iteration_callback)(trees)
         end
       end
-      print("$duration sec/tree     ")
+      mpi_print(mpi_comm, "$duration sec/tree     ")
     end
   catch expection
-    println()
+    mpi_print(mpi_comm, "\n")
     if isa(expection, EarlyStop)
     else
       rethrow()
@@ -979,11 +977,20 @@ logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε)
 @inline ∇logloss(y, ŷ) = ŷ - y
 @inline ∇∇logloss(ŷ)   = ŷ * (1.0f0 - ŷ) # Interestingly, not dependent on y. XGBoost adds an ε term
 
-function mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf_features_histograms)
+# Only print on the root process
+function mpi_print(comm, str)
+  if isnothing(comm) || MPI.Comm_rank(comm) == 0
+    print(str)
+  end
+end
+
+function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histograms)
+  isnothing(comm) && return ()
   # The slow way, lots of communication.
   for feature_i in feature_is_to_compute
-    MPI.Allreduce!(leaf_features_histograms[feature_i], +, mpi_comm)
+    MPI.Allreduce!(leaf_features_histograms[feature_i], +, comm)
   end
+  ()
 end
 
 function mpi_max(comm, x)
@@ -1001,6 +1008,7 @@ function mpi_mean(comm, my_Σ, my_weight)
 end
 
 function mpi_compute_on_one_and_share(f, comm)
+  isnothing(comm) && return f()
   out = MPI.Comm_rank(comm) == 0 ? f() : nothing
   out = MPI.bcast(out, 0, comm)
   out
