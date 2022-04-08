@@ -171,9 +171,7 @@ end
 const ε = 1f-7 # Smallest Float32 power of 10 you can add to 1.0 and not round off to 1.0
 
 const Score      = Float32
-const Score64    = Float64
 const Loss       = Float32
-const Loss64     = Float64
 const Prediction = Float32
 const DataWeight = Float32
 
@@ -221,7 +219,7 @@ const dont_split = SplitCandidate(0f0, 0, 0x00, 0f0, 0f0, 0f0, 0f0)
 
 #   Histogram(bin_count) = new(zeros(Loss, bin_count), zeros(Loss, bin_count), zeros(DataWeight, bin_count))
 # end
-const Histogram = Vector{Loss64}
+const Histogram = Vector{Loss}
 
 
 mutable struct Node <: Tree
@@ -314,7 +312,7 @@ function load_unbinned_predictor(path)
   tree_funcs = map(tree -> tree_to_function(bin_splits, tree), trees)
 
   predict(X) = begin
-    thread_scores = map(_ -> zeros(Score64, data_count(X)), 1:Threads.nthreads())
+    thread_scores = map(_ -> zeros(Score, data_count(X)), 1:Threads.nthreads())
 
     Threads.@threads for tree_func in tree_funcs
       tree_func(X, thread_scores[Threads.threadid()])
@@ -466,13 +464,13 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid).
-function apply_tree(X_binned :: Data, tree :: Tree) :: Vector{Score64}
-  scores = zeros(Score64, data_count(X_binned))
+function apply_tree(X_binned :: Data, tree :: Tree) :: Vector{Score}
+  scores = zeros(Score, data_count(X_binned))
   apply_tree!(X_binned, tree, scores)
 end
 
 # Mutates scores.
-function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score64}) :: Vector{Score64}
+function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   # Would love to generate a function and use it, but can't seem to dodge world conflicts and invokelatest was slow.
   fast_nodes = tree_to_fast_nodes(tree)
 
@@ -495,7 +493,7 @@ function tree_to_fast_nodes(leaf :: Leaf, node_i = 1) :: Vector{FastNode}
 end
 
 # Mutates scores.
-function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :: Vector{Score64}) :: Vector{Score64}
+function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}) :: Vector{Score}
   Threads.@threads for i in 1:data_count(X_binned)
     node_i = 1
     @inbounds while true
@@ -548,10 +546,10 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
-function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score64}
+function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}
 
   # thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
-  scores = zeros(Score64, data_count(X_binned))
+  scores = zeros(Score, data_count(X_binned))
 
   # Threads.@threads for tree in trees
   for tree in trees
@@ -577,12 +575,11 @@ function predict(X, bin_splits, trees; starting_scores = nothing, output_raw_sco
 end
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false)
+function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
   scores = apply_trees(X_binned, trees; starting_scores = starting_scores)
   if output_raw_scores
     scores
   else
-    scores = Float32.(scores)
     parallel_map!(σ, scores, scores)
   end
 end
@@ -751,14 +748,14 @@ index_type(array) = length(array) < typemax(UInt32) ? UInt32 : Int64
 
 mutable struct ScratchHistograms
   next_free_i :: Threads.Atomic{Int64}
-  histograms  :: Vector{Vector{Loss64}}
-  consolidated_for_mpi_communication :: Union{Vector{Loss64},Nothing}
+  histograms  :: Vector{Vector{Loss}}
+  consolidated_for_mpi_communication :: Union{Vector{Loss},Nothing}
 
   ScratchHistograms(X_binned; config...) = begin
     features_to_use_count = Int(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
     histogram_count = features_to_use_count * min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
-    histogram_size  = 4*max_bins + Int(64/sizeof(Loss64)) # Ensure no two features share a cache line...allocate a little extra.
-    histograms = map(_ -> resize!(Vector{Loss64}(undef, histogram_size), 4*max_bins), 1:histogram_count)
+    histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
+    histograms = map(_ -> resize!(Vector{Loss}(undef, histogram_size), 4*max_bins), 1:histogram_count)
 
     new(Threads.Atomic{Int64}(1), histograms, nothing)
   end
@@ -776,11 +773,11 @@ function next_free_histogram(scratch_histograms :: ScratchHistograms)
       scratch_histograms.histograms[free_i]
     else
       println("WARNING: Math off: should never need to allocate new histograms")
-      histogram_size  = 4*max_bins + Int(64/sizeof(Loss64))
-      resize!(Vector{Loss64}(undef, histogram_size), 4*max_bins)
+      histogram_size  = 4*max_bins + Int(64/sizeof(Loss))
+      resize!(Vector{Loss}(undef, histogram_size), 4*max_bins)
     end
 
-  fill!(histogram, Loss64(0))
+  fill!(histogram, Loss(0))
 end
 
 # Reusable memory to avoid allocations between trees.
@@ -797,7 +794,7 @@ mutable struct ScratchMemory
 
   ScratchMemory(X_binned, y; config...) = begin
     histogram_count = min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
-    histogram_size  = 4*max_bins + Int(64/sizeof(Loss64)) # Ensure no two features share a cache line...allocate a little extra.
+    histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
 
     new(
       Vector{Loss}(undef, data_count(X_binned)*4),
@@ -875,7 +872,7 @@ end
 
 
 # Returns new tree
-function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score64}; scratch_memory = nothing, mpi_comm = nothing, config...) :: Tree
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, mpi_comm = nothing, config...) :: Tree
   if isnothing(scratch_memory)
     scratch_memory = ScratchMemory(X_binned, y, config...)
   end
@@ -1154,8 +1151,8 @@ end
 
 function sum_∇loss_∇∇loss(∇losses, ∇∇losses)
   thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(∇losses)) do thread_range
-    Σ∇loss  = zero(Loss64)
-    Σ∇∇loss = zero(Loss64)
+    Σ∇loss  = zero(Loss)
+    Σ∇∇loss = zero(Loss)
     @inbounds for i in thread_range
       Σ∇loss  += ∇losses[i]
       Σ∇∇loss += ∇∇losses[i]
@@ -1163,7 +1160,7 @@ function sum_∇loss_∇∇loss(∇losses, ∇∇losses)
     (Σ∇loss, Σ∇∇loss)
   end
 
-  (Loss(sum(thread_Σ∇losses)), Loss(sum(thread_Σ∇∇losses)))
+  (sum(thread_Σ∇losses), sum(thread_Σ∇∇losses))
 end
 
 # -0.5 * (Σ∇loss)² / (Σ∇∇loss) in XGBoost paper; but can't simplify so much if clamping the score.
@@ -1411,26 +1408,14 @@ function _build_histogram_unrolled!(X_binned, feature_start_i, ∇losses_∇∇l
     # # bin_i4 = feature_binned[i4]
 
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
-    bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram, bin_i1)
-    # loss_info_i = llw_base_i(ii)
-    # loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
+    bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i1)
+    loss_info_i = llw_base_i(ii)
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
+    SIMD.vstorea(bin + loss_info, histogram, bin_i1)
 
-    ∇l  = ∇losses_∇∇losses_weights[llw_base_i(ii)]
-    ∇∇l = ∇losses_∇∇losses_weights[llw_base_i(ii)+1]
-    w   = ∇losses_∇∇losses_weights[llw_base_i(ii)+2]
-    loss_info = SIMD.Vec{4,Float64}((Float64(∇l),Float64(∇∇l),Float64(w),0.0))
-
-    SIMD.vstorea(bin + SIMD.Vec{4,Float64}(loss_info), histogram, bin_i1)
-
-    bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram, bin_i2)
-
-    ∇l  = ∇losses_∇∇losses_weights[llw_base_i(ii)+4]
-    ∇∇l = ∇losses_∇∇losses_weights[llw_base_i(ii)+4+1]
-    w   = ∇losses_∇∇losses_weights[llw_base_i(ii)+4+2]
-    loss_info = SIMD.Vec{4,Float64}((Float64(∇l),Float64(∇∇l),Float64(w),0.0))
-
-    # loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
-    SIMD.vstorea(bin + SIMD.Vec{4,Float64}(loss_info), histogram, bin_i2)
+    bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i2)
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
+    SIMD.vstorea(bin + loss_info, histogram, bin_i2)
 
     # histogram[bin_i1]     += ∇losses_∇∇losses_weights[llw_i1]
     # histogram[bin_i2]     += ∇losses_∇∇losses_weights[llw_i2]
@@ -1497,38 +1482,28 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     # feat3_bin_i = llw_base_i(X_binned[feature_start_i3 + i])
 
     loss_info_i = llw_base_i(ii)
-
-    ∇l  = ∇losses_∇∇losses_weights[loss_info_i ]
-    ∇∇l = ∇losses_∇∇losses_weights[loss_info_i+1]
-    w   = ∇losses_∇∇losses_weights[loss_info_i+2]
-    loss_info1 = SIMD.Vec{4,Float64}((Float64(∇l),Float64(∇∇l),Float64(w),0.0))
-    ∇l  = ∇losses_∇∇losses_weights[loss_info_i+4]
-    ∇∇l = ∇losses_∇∇losses_weights[loss_info_i+4+1]
-    w   = ∇losses_∇∇losses_weights[loss_info_i+4+2]
-    loss_info2 = SIMD.Vec{4,Float64}((Float64(∇l),Float64(∇∇l),Float64(w),0.0))
-
-    # loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
-    # loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
+    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
+    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
 
     feat1_bin_i1 = llw_base_i(X_binned[feature_start_i1 + i1])
     feat2_bin_i1 = llw_base_i(X_binned[feature_start_i2 + i1])
 
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
-    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i1)
-    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i1)
+    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1)
+    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1)
 
-    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i)
-    SIMD.vstorea(feat1_bin + SIMD.Vec{4,Float64}(loss_info1), histogram1, feat1_bin_i1)
-    SIMD.vstorea(feat2_bin + SIMD.Vec{4,Float64}(loss_info1), histogram2, feat2_bin_i1)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i)
+    SIMD.vstorea(feat1_bin + loss_info1, histogram1, feat1_bin_i1)
+    SIMD.vstorea(feat2_bin + loss_info1, histogram2, feat2_bin_i1)
     # SIMD.vstorea(feat3_bin + loss_info, histogram3, feat3_bin_i)
 
     feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
     feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
 
-    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i2)
-    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i2)
-    SIMD.vstorea(feat1_bin + SIMD.Vec{4,Float64}(loss_info2), histogram1, feat1_bin_i2)
-    SIMD.vstorea(feat2_bin + SIMD.Vec{4,Float64}(loss_info2), histogram2, feat2_bin_i2)
+    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i2)
+    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i2)
+    SIMD.vstorea(feat1_bin + loss_info2, histogram1, feat1_bin_i2)
+    SIMD.vstorea(feat2_bin + loss_info2, histogram2, feat2_bin_i2)
   end
 
   ()
@@ -1611,31 +1586,26 @@ function _build_3histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     feat3_bin_i1 = llw_base_i(X_binned[feature_start_i3 + i1])
     # feat4_bin_i1 = llw_base_i(X_binned[feature_start_i4 + i1])
 
-    ∇l  = ∇losses_∇∇losses_weights[llw_base_i(ii)]
-    ∇∇l = ∇losses_∇∇losses_weights[llw_base_i(ii)+1]
-    w   = ∇losses_∇∇losses_weights[llw_base_i(ii)+2]
-    # loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(ii))
-    loss_info = SIMD.Vec{4,Float64}((Float64(∇l),Float64(∇∇l),Float64(w),0.0))
-
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(ii))
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
-    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i1)
-    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i1)
-    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i1)
-    # feat4_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram4, feat4_bin_i1)
+    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1)
+    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i1)
+    # feat4_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram4, feat4_bin_i1)
 
-    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i)
-    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i1) + loss_info, histogram1, feat1_bin_i1)
-    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i1) + loss_info, histogram2, feat2_bin_i1)
-    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i1) + loss_info, histogram3, feat3_bin_i1)
-    # SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram4, feat4_bin_i1) + loss_info, histogram4, feat4_bin_i1)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1) + loss_info, histogram1, feat1_bin_i1)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1) + loss_info, histogram2, feat2_bin_i1)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i1) + loss_info, histogram3, feat3_bin_i1)
+    # SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram4, feat4_bin_i1) + loss_info, histogram4, feat4_bin_i1)
     # SIMD.vstorea(feat4_bin + loss_info, features_histograms[4], feat4_bin_i1)
     # SIMD.vstorea(feat3_bin + loss_info, histogram3, feat3_bin_i)
 
     # feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
     # feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
 
-    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i2)
-    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i2)
+    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i2)
+    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i2)
     # SIMD.vstorea(feat1_bin + loss_info2, histogram1, feat1_bin_i2)
     # SIMD.vstorea(feat2_bin + loss_info2, histogram2, feat2_bin_i2)
   end
@@ -1779,10 +1749,10 @@ end
 
 
 mutable struct Hists
-  hist1 :: Vector{Loss64}
-  hist2 :: Vector{Loss64}
-  hist3 :: Vector{Loss64}
-  # hist4 :: Vector{Loss64}
+  hist1 :: Vector{Loss}
+  hist2 :: Vector{Loss}
+  hist3 :: Vector{Loss}
+  # hist4 :: Vector{Loss}
 end
 
 function make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms)
@@ -1929,14 +1899,14 @@ end
 
 # returns Σ∇losses, Σ∇∇losses, Σweights
 function sum_histogram(histogram)
-  Σ∇losses_Σ∇∇losses_Σweights_Σdummy = SIMD.Vec{4,Float64}(0)
+  Σ∇losses_Σ∇∇losses_Σweights_Σdummy = SIMD.Vec{4,Float32}(0)
   @inbounds for i in 1:4:length(histogram)
-    Σ∇losses_Σ∇∇losses_Σweights_Σdummy += SIMD.vloada(SIMD.Vec{4,Float64}, histogram, i)
+    Σ∇losses_Σ∇∇losses_Σweights_Σdummy += SIMD.vloada(SIMD.Vec{4,Float32}, histogram, i)
   end
 
-  Σ∇losses, Σ∇∇losses, Σweights, Σdummy = NTuple{4,Float64}(Σ∇losses_Σ∇∇losses_Σweights_Σdummy)
+  Σ∇losses, Σ∇∇losses, Σweights, Σdummy = NTuple{4,Float32}(Σ∇losses_Σ∇∇losses_Σweights_Σdummy)
 
-  Float32.((Σ∇losses, Σ∇∇losses, Σweights))
+  (Σ∇losses, Σ∇∇losses, Σweights)
 end
 
 # Resets and mutates scratch_split_candidate
@@ -1968,9 +1938,9 @@ function best_split_for_feature!(scratch_split_candidate, histogram, min_data_we
 
   @inbounds for bin_i in UInt8(1):UInt8(max_bins-1)
     llw_i = llw_base_i(bin_i)
-    left_Σ∇loss      += Float32(histogram[llw_i])
-    left_Σ∇∇loss     += Float32(histogram[llw_i+1])
-    left_data_weight += Float32(histogram[llw_i+2])
+    left_Σ∇loss      += histogram[llw_i]
+    left_Σ∇∇loss     += histogram[llw_i+1]
+    left_data_weight += histogram[llw_i+2]
 
     if left_data_weight < min_data_weight_in_leaf
       continue
