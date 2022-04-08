@@ -559,7 +559,7 @@ function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores 
 
   # scores = sum(thread_scores)
 
-  if starting_scores != nothing
+  if !isnothing(starting_scores)
     scores += starting_scores
   end
 
