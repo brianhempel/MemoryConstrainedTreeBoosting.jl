@@ -1,4 +1,4 @@
-run_tests:
+test:
 	JULIA_NUM_THREADS=${CORE_COUNT} julia --project=. test/Test.jl
 
 profile:
@@ -11,7 +11,7 @@ profile_hrrr:
 	# julia --project=. test/Profile.jl
 	JULIA_NUM_THREADS=${CORE_COUNT} julia --project=. test/ProfileHRRR.jl
 
-evaluate:
+evaluation:
 	# May need to turn threads off in various functions
 	julia --project=. test/Evaluation.jl
 	# JULIA_NUM_THREADS=${CORE_COUNT} julia --project=. test/Evaluation.jl
@@ -29,4 +29,4 @@ distributed_profile:
 distributed_evaluation:
 	# May need to turn threads off in various functions
 	mpiexecjl -n 3 julia --project=. test/DistributedEvaluation.jl
-	# JULIA_NUM_THREADS=${CORE_COUNT} mpiexecjl -n 3 julia --project=. test/DistributedEvaluation.jl
+	# JULIA_NUM_THREADS=${CORE_COUNT} mpiexecjl -n 2 julia --project=. test/DistributedEvaluation.jl

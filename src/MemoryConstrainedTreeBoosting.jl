@@ -1043,13 +1043,13 @@ end
 
 function compute_mean_probability(y, weights; mpi_comm = nothing)
   thread_Σlabels, thread_Σweight = parallel_iterate(length(y)) do thread_range
-    Σlabel  = zero(Prediction)
-    Σweight = zero(DataWeight)
+    Σlabel  = 0.0
+    Σweight = 0.0
     @inbounds for i in thread_range
-      Σlabel  += y[i] * weights[i]
-      Σweight += weights[i]
+      Σlabel  += Float64(y[i] * weights[i])
+      Σweight += Float64(weights[i])
     end
-    (Σlabel, Σweight)
+    (Float32(Σlabel), Float32(Σweight))
   end
   mpi_mean(mpi_comm, sum(thread_Σlabels), sum(thread_Σweight))
 end
@@ -1061,14 +1061,14 @@ end
 
 function _compute_mean_logloss(y, scores, weights :: Nothing)
   thread_Σlosses = parallel_iterate(length(y)) do thread_range
-    Σloss   = zero(Loss)
+    Σloss   = 0.0
     @inbounds for i in thread_range
       ŷ_i      = σ(scores[i])
-      Σloss   += logloss(y[i], ŷ_i)
+      Σloss   += Float64(logloss(y[i], ŷ_i))
     end
-    Σloss
+    Float32(Σloss)
   end
-  sum(thread_Σlosses), length(y)
+  sum(thread_Σlosses), Float32(length(y))
 end
 
 function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
@@ -1076,14 +1076,14 @@ function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
   # ŷ = σ.(scores)
   # mean_logloss = sum(logloss.(y, ŷ) .* weights) / sum(weights)
   thread_Σlosses, thread_Σweights = parallel_iterate(length(y)) do thread_range
-    Σloss   = zero(Loss)
-    Σweight = zero(DataWeight)
+    Σloss   = 0.0
+    Σweight = 0.0
     @inbounds for i in thread_range
       ŷ_i      = σ(scores[i])
-      Σloss   += logloss(y[i], ŷ_i) * weights[i]
-      Σweight += weights[i]
+      Σloss   += Float64(logloss(y[i], ŷ_i) * weights[i])
+      Σweight += Float64(weights[i])
     end
-    (Σloss, Σweight)
+    (Float32(Σloss), Float32(Σweight))
   end
   sum(thread_Σlosses), sum(thread_Σweights)
 end
@@ -1151,13 +1151,13 @@ end
 
 function sum_∇loss_∇∇loss(∇losses, ∇∇losses)
   thread_Σ∇losses, thread_Σ∇∇losses = parallel_iterate(length(∇losses)) do thread_range
-    Σ∇loss  = zero(Loss)
-    Σ∇∇loss = zero(Loss)
+    Σ∇loss  = 0.0
+    Σ∇∇loss = 0.0
     @inbounds for i in thread_range
-      Σ∇loss  += ∇losses[i]
-      Σ∇∇loss += ∇∇losses[i]
+      Σ∇loss  += Float64(∇losses[i])
+      Σ∇∇loss += Float64(∇∇losses[i])
     end
-    (Σ∇loss, Σ∇∇loss)
+    (Float32(Σ∇loss), Float32(Σ∇∇loss))
   end
 
   (sum(thread_Σ∇losses), sum(thread_Σ∇∇losses))
