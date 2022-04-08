@@ -749,6 +749,7 @@ index_type(array) = length(array) < typemax(UInt32) ? UInt32 : Int64
 mutable struct ScratchHistograms
   next_free_i :: Threads.Atomic{Int64}
   histograms  :: Vector{Vector{Loss}}
+  consolidated_for_mpi_communication :: Union{Vector{Loss},Nothing}
 
   ScratchHistograms(X_binned; config...) = begin
     features_to_use_count = Int(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
@@ -756,7 +757,7 @@ mutable struct ScratchHistograms
     histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
     histograms = map(_ -> resize!(Vector{Loss}(undef, histogram_size), 4*max_bins), 1:histogram_count)
 
-    new(Threads.Atomic{Int64}(1), histograms)
+    new(Threads.Atomic{Int64}(1), histograms, nothing)
   end
 end
 
@@ -984,12 +985,38 @@ function mpi_print(comm, str)
   end
 end
 
-function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histograms)
+function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histograms, scratch_histograms)
   isnothing(comm) && return ()
-  # The slow way, lots of communication.
-  for feature_i in feature_is_to_compute
-    MPI.Allreduce!(leaf_features_histograms[feature_i], +, comm)
+  length(feature_is_to_compute) == 0 && return ()
+
+  # # The slow but simple way, lots of communication.
+  # for feature_i in feature_is_to_compute
+  #   MPI.Allreduce!(leaf_features_histograms[feature_i], +, comm)
+  # end
+
+  # Smash all the histograms into one long array before sending off.
+  # Reduces communication calls.
+
+  hist_size = length(leaf_features_histograms[feature_is_to_compute[1]])
+
+  if isnothing(scratch_histograms.consolidated_for_mpi_communication)
+    scratch_histograms.consolidated_for_mpi_communication = Vector{Loss}(undef, hist_size * length(feature_is_to_compute))
   end
+  buf = scratch_histograms.consolidated_for_mpi_communication
+
+  # We thread all the other places like this, so...
+  Threads.@threads for feature_ii in 1:length(feature_is_to_compute)
+    feature_i = feature_is_to_compute[feature_ii]
+    buf[(feature_ii-1)*hist_size + 1 : feature_ii*hist_size] = leaf_features_histograms[feature_i]
+  end
+
+  MPI.Allreduce!(buf, +, comm)
+
+  Threads.@threads for feature_ii in 1:length(feature_is_to_compute)
+    feature_i = feature_is_to_compute[feature_ii]
+    leaf_features_histograms[feature_i][:] = @view buf[(feature_ii-1)*hist_size + 1 : feature_ii*hist_size]
+  end
+
   ()
 end
 
@@ -1212,7 +1239,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
           compute_histograms!(X_binned, ∇losses_∇∇losses_weights_consolidated, feature_is_to_compute, leaf.features_histograms, leaf.is)
 
           # We only calculated the histogram for our local data. Sum with the rest of the data, so histograms are global.
-          mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf.features_histograms)
+          mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf.features_histograms, scratch_histograms)
         end
 
         leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
