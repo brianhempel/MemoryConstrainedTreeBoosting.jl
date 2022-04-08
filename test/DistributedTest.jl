@@ -111,6 +111,38 @@ if rank == root
   println("  expected ŷ: $(expected_ŷ_full)")
   println()
 
-  @assert ŷ_full == expected_ŷ_full
+  @assert ŷ_full == expected_ŷ_full # this will segfault MPI if it fails. oh well
 end
 
+rank == root && println("Testing early stopping...")
+
+# Dirty the validation labels
+# validation_y = map(y -> rand() < 0.2 ? 1f0 - y : y, validation_y)
+
+max_iterations_without_improvement = 10
+make_callback() = make_callback_to_track_validation_loss(
+  validation_X_binned,
+  validation_y;
+  mpi_comm = comm, # May deadlock if you forget this, because some procs will stop before others
+  validation_weights = validation_weights,
+  max_iterations_without_improvement = max_iterations_without_improvement
+)
+
+trees = train_on_binned(
+  X_binned, y,
+  weights                 = weights,
+  iteration_callback      = make_callback(),
+  iteration_count         = 1000000,
+  min_data_weight_in_leaf = 2.0,
+  learning_rate           = 0.3,
+  bagging_temperature     = 0.0, # otherwise, non-deterministic
+  mpi_comm                = comm,
+);
+
+iteration_count = length(trees) - 1 + max_iterations_without_improvement
+
+print("Rank $rank, $iteration_count iterations (expected 673)\n")
+
+MPI.Barrier(comm)
+@assert iteration_count == 673 # this will segfault MPI if it fails. oh well
+MPI.Barrier(comm)
