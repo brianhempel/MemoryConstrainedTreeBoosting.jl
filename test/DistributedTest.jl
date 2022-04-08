@@ -84,6 +84,7 @@ validation_X_binned = apply_bins(validation_X, bin_splits)
 make_callback() = make_callback_to_track_validation_loss(
   validation_X_binned,
   validation_y;
+  mpi_comm = comm,
   validation_weights = validation_weights
 )
 
