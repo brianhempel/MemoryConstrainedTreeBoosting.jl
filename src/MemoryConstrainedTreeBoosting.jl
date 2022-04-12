@@ -852,7 +852,7 @@ function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], mpi_comm = not
           get_config_field(config, :iteration_callback)(trees)
         end
       end
-      mpi_print(mpi_comm, "$duration sec/tree     ")
+      mpi_print(mpi_comm, "$duration sec/tree     \n")
     end
   catch expection
     mpi_print(mpi_comm, "\n")
