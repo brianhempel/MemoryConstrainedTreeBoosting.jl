@@ -185,8 +185,6 @@ data_count(X :: Array{<:Number,2}) = size(X,1)
 
 feature_count(X :: Array{<:Number,2}) = size(X,2)
 
-get_feature(X_binned :: Data, feature_i) = @view X_binned[:, feature_i]
-
 
 abstract type Tree end
 
@@ -464,13 +462,13 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid).
-function apply_tree(X_binned :: Data, tree :: Tree) :: Vector{Score}
+function apply_tree(X_binned, tree :: Tree) :: Vector{Score}
   scores = zeros(Score, data_count(X_binned))
   apply_tree!(X_binned, tree, scores)
 end
 
 # Mutates scores.
-function apply_tree!(X_binned :: Data, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
+function apply_tree!(X_binned, tree :: Tree, scores :: Vector{Score}) :: Vector{Score}
   # Would love to generate a function and use it, but can't seem to dodge world conflicts and invokelatest was slow.
   fast_nodes = tree_to_fast_nodes(tree)
 
@@ -493,7 +491,7 @@ function tree_to_fast_nodes(leaf :: Leaf, node_i = 1) :: Vector{FastNode}
 end
 
 # Mutates scores.
-function _apply_tree!(X_binned :: Data, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}) :: Vector{Score}
+function _apply_tree!(X_binned, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}) :: Vector{Score}
   Threads.@threads for i in 1:data_count(X_binned)
     node_i = 1
     @inbounds while true
@@ -546,7 +544,7 @@ end
 
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
-function apply_trees(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}
+function apply_trees(X_binned, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}
 
   # thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
   scores = zeros(Score, data_count(X_binned))
@@ -575,7 +573,7 @@ function predict(X, bin_splits, trees; starting_scores = nothing, output_raw_sco
 end
 
 # Returns vector of predictions ŷ (post-sigmoid).
-function predict_on_binned(X_binned :: Data, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
+function predict_on_binned(X_binned, trees :: Vector{<:Tree}; starting_scores = nothing, output_raw_scores = false) :: Vector{Prediction}
   scores = apply_trees(X_binned, trees; starting_scores = starting_scores)
   if output_raw_scores
     scores
@@ -809,7 +807,7 @@ mutable struct ScratchMemory
   end
 end
 
-function train_on_binned(X_binned :: Data, y; prior_trees=Tree[], mpi_comm = nothing, config...) :: Vector{Tree}
+function train_on_binned(X_binned, y; prior_trees=Tree[], mpi_comm = nothing, config...) :: Vector{Tree}
   weights = get_config_field(config, :weights)
   if isnothing(weights)
     weights = ones(DataWeight, length(y))
@@ -932,7 +930,7 @@ function bagged_weights!(weights, bagging_temperature, out)
   ()
 end
 
-function build_one_tree(X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
+function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
   max_data_count_on_single_machine = mpi_max(mpi_comm, length(all_is))
@@ -1173,7 +1171,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
+function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
 
   # This still allocates :/
   leaves = sort(tree_leaves(tree), by = (leaf -> leaf.max_data_count_on_single_machine)) # Process smallest leaves first, should speed up histogram computation.
@@ -1262,7 +1260,7 @@ function perhaps_split_tree(tree, X_binned :: Data, ∇losses_∇∇losses_weigh
     feature_i = split_candidate.feature_i
     split_i   = split_candidate.split_i
 
-    feature_binned = get_feature(X_binned, feature_i)
+    feature_binned = @view X_binned[:, feature_i]
 
     # If root node, switch from unit range to our scratch memory
     scratch_is = isa(leaf_to_split.is, UnitRange) ? is : leaf_to_split.is
