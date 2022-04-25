@@ -38,6 +38,7 @@ bin_splits, trees =
     max_delta_score         = 1.0e10, # Before shrinkage.
     learning_rate           = 0.03,
     feature_fraction        = 1.0, # Per tree.
+    exclude_features        = [], # Indices. Applied before feature_fraction
     bagging_temperature     = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
     iteration_callback                 = nothing, # Optional. Callback is given trees. If you want to override the default early stopping validation callback which is auto-generated if validation data is provided.
   	validation_X                       = nothing,
@@ -168,7 +169,7 @@ for config in hyperparameter_configs
       global_best_loss = validation_loss
     end
   end
-  
+
   train_on_binned(
     X_binned, y; weights = weights,
     iteration_callback = my_iteration_callback,
@@ -221,7 +222,7 @@ bin_splits =
   end
 # Share bin_splits with all processes
 # (not necessary if you used load("bin_splits"), because all processes did that)
-bin_splits = MPI.bcast(bin_splits, root, comm) 
+bin_splits = MPI.bcast(bin_splits, root, comm)
 
 # Here's a convenience function for determining a process's chunk of a large array.
 #
@@ -267,7 +268,6 @@ trees = train_on_binned(
   iteration_count         = 20,
   min_data_weight_in_leaf = 2.0,
   learning_rate           = 0.3,
-  bagging_temperature     = 0.0, # otherwise, non-deterministic
   mpi_comm                = comm,
 );
 

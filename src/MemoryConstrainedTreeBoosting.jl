@@ -149,6 +149,7 @@ default_config = (
   max_delta_score                    = 1.0e10, # Before shrinkage.
   learning_rate                      = 0.03,
   feature_fraction                   = 1.0, # Per tree.
+  exclude_features                   = [], # Indices. Applied before feature_fraction
   bagging_temperature                = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
   feature_i_to_name                  = nothing,
   iteration_callback                 = nothing, # Optional. Callback is given trees. If you want to override the default early stopping validation callback.
@@ -750,7 +751,8 @@ mutable struct ScratchHistograms
   consolidated_for_mpi_communication :: Union{Vector{Loss},Nothing}
 
   ScratchHistograms(X_binned; config...) = begin
-    features_to_use_count = Int(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+    raw_features_count = feature_count(X_binned) - length(unique(get_config_field(config, :exclude_features)))
+    features_to_use_count = Int(ceil(get_config_field(config, :feature_fraction) * raw_features_count))
     histogram_count = features_to_use_count * min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
     histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
     histograms = map(_ -> resize!(Vector{Loss}(undef, histogram_size), 4*max_bins), 1:histogram_count)
@@ -944,12 +946,17 @@ function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇�
       []       # feature_histograms
     )
 
-  features_to_use_count = UInt32(ceil(get_config_field(config, :feature_fraction) * feature_count(X_binned)))
+  raw_features_count = feature_count(X_binned) - length(unique(get_config_field(config, :exclude_features)))
+  features_to_use_count = UInt32(ceil(get_config_field(config, :feature_fraction) * raw_features_count))
 
   # This still allocates :/
   # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
   feature_is = mpi_compute_on_one_and_share(mpi_comm) do
-    sort(Random.shuffle(UInt32(1):UInt32(feature_count(X_binned)))[1:features_to_use_count])
+    sort(
+      Random.shuffle(
+        setdiff(UInt32(1):UInt32(feature_count(X_binned)), get_config_field(config, :exclude_features))
+      )[1:features_to_use_count]
+    )
   end
 
   tree_changed = true

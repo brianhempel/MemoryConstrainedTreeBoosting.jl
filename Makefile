@@ -1,4 +1,4 @@
-test:
+tests:
 	JULIA_NUM_THREADS=${CORE_COUNT} julia --project=. test/Test.jl
 
 profile:
