@@ -319,6 +319,13 @@ function load_unbinned_predictor(path)
 
     σ.(sum(thread_scores))
   end
+
+  # SUPER slow the first time you call it for some reason, so let's hit the JIT
+  feature_count = length(bin_splits)
+  dummy_X = fill(-Inf32, (1, feature_count))
+  predict(dummy_X)
+
+  predict
 end
 
 function print_tree(tree, level = 0; feature_i_to_name = nothing)
