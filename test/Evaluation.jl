@@ -107,7 +107,7 @@ iteration_callback() =
 
 train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_leaves = 6, bagging_temperature = 0.25, iteration_callback = iteration_callback())
 
-@time train_on_binned(
+@time trees = train_on_binned(
   X_binned, y,
   iteration_count = 10_000,
   learning_rate = 0.01,
@@ -121,3 +121,24 @@ train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_le
   iteration_callback = iteration_callback()
 )
 println("")
+
+ŷ1 = predict(validation_data, bin_splits, trees)
+
+path = tempname(cleanup = true)
+save(path, bin_splits, trees)
+load_unbinned_predictor(path)
+@time save(path, bin_splits, trees)
+unbinned_predict = @time load_unbinned_predictor(path)
+
+ŷ2 = unbinned_predict(validation_data)
+ŷ2 = @time unbinned_predict(validation_data)
+
+println(size(validation_data))
+println(sum(abs.(ŷ2 .- ŷ1)))
+
+bin_splits, trees = load(path)
+
+ŷ3 = predict(validation_data, bin_splits, trees)
+
+println(sum(abs.(ŷ3 .- ŷ1)))
+@assert sum(abs.(ŷ3 .- ŷ1)) / size(validation_data,1) < 0.00001

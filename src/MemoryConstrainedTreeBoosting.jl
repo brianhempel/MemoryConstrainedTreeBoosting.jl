@@ -536,7 +536,7 @@ end
 function tree_to_exp(bin_splits, node :: Node)
   threshold = isnothing(bin_splits) ? node.split_i : bin_splits[node.feature_i][node.split_i]
   quote
-    if X[i, $(node.feature_i)] <= $(threshold)
+    if X[i, $(node.feature_i)] < $(threshold)
       $(tree_to_exp(bin_splits, node.left))
     else
       $(tree_to_exp(bin_splits, node.right))
