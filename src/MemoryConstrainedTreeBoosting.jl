@@ -304,26 +304,44 @@ function load(path)
   (Vector{BinSplits{FeatureType}}(bin_splits), Vector{Tree}(trees))
 end
 
-# Returns a JIT-able function that takes in data and returns predictions.
+# I tried to use Julia's JIT, but it was horreeeeendeously slow to compile the trees
+# to native code (sometimes on the order of minutes). Of course, it was blazing fast_nodes
+# once that was done, but...
 function load_unbinned_predictor(path)
   bin_splits, trees = load(path)
 
-  tree_funcs = map(tree -> tree_to_function(bin_splits, tree), trees)
+  fast_trees = map(tree_to_fast_nodes, trees)
 
   predict(X) = begin
-    thread_scores = map(_ -> zeros(Score, data_count(X)), 1:Threads.nthreads())
+    thread_scores = parallel_iterate(length(fast_trees)) do thread_range
+      scores = zeros(Score, data_count(X))
 
-    Threads.@threads for tree_func in tree_funcs
-      tree_func(X, thread_scores[Threads.threadid()])
+      for tree_i in thread_range
+        fast_nodes = fast_trees[tree_i]
+
+        @inbounds for i in 1:data_count(X)
+          node_i = 1
+          @inbounds while true
+            node = fast_nodes[node_i]
+            if node.feature_i > 0
+              if X[i, node.feature_i] < bin_splits[node.feature_i][node.split_i]
+                node_i = node.left_i
+              else
+                node_i = node.right_i
+              end
+            else
+              scores[i] += node.Δscore
+              break
+            end
+          end
+        end
+      end
+
+      scores
     end
 
     σ.(sum(thread_scores))
   end
-
-  # SUPER slow the first time you call it for some reason, so let's hit the JIT
-  feature_count = length(bin_splits)
-  dummy_X = fill(-Inf32, (1, feature_count))
-  predict(dummy_X)
 
   predict
 end
@@ -518,38 +536,6 @@ function _apply_tree!(X_binned, fast_nodes :: Vector{FastNode}, scores :: Vector
   end
   scores
 end
-
-# Returns a function tree_func(X, scores) that runs the tree on data X and mutates scores
-#
-# If bin_splits == nothing, assumes data is already binned
-function tree_to_function(bin_splits, tree)
-  eval(quote
-    (X, scores) -> begin
-      for i in 1:data_count(X)
-        $(tree_to_exp(bin_splits, tree))
-      end
-    end
-  end)
-end
-
-# If bin_splits == nothing, then assumes the data is already binned
-function tree_to_exp(bin_splits, node :: Node)
-  threshold = isnothing(bin_splits) ? node.split_i : bin_splits[node.feature_i][node.split_i]
-  quote
-    if X[i, $(node.feature_i)] < $(threshold)
-      $(tree_to_exp(bin_splits, node.left))
-    else
-      $(tree_to_exp(bin_splits, node.right))
-    end
-  end
-end
-
-function tree_to_exp(bin_splits, leaf :: Leaf)
-  quote
-    scores[i] += $(leaf.Δscore)
-  end
-end
-
 
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
 function apply_trees(X_binned, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}

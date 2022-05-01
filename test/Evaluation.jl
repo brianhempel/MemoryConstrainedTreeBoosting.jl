@@ -135,6 +135,7 @@ unbinned_predict = @time load_unbinned_predictor(path)
 
 println(size(validation_data))
 println(sum(abs.(ŷ2 .- ŷ1)))
+@assert sum(abs.(ŷ2 .- ŷ1)) / size(validation_data,1) < 0.00001
 
 bin_splits, trees = load(path)
 
