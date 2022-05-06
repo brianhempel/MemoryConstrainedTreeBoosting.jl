@@ -696,7 +696,7 @@ end
 
 # Trains for iteration_count rounds and returns (bin_splits, prior_and_new_trees).
 function train(X :: Array{FeatureType,2}, y; bin_splits=nothing, prior_trees=Tree[], config...) :: Tuple{Vector{BinSplits{FeatureType}}, Vector{Tree}} where FeatureType <: AbstractFloat
-  if bin_splits == nothing
+  if isnothing(bin_splits)
     print("Preparing bin splits...")
     bin_splits = prepare_bin_splits(X; bin_count = get_config_field(config, :bin_count))
     println("done.")
@@ -786,13 +786,13 @@ mutable struct ScratchMemory
   falses   :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
   scratch_histograms :: ScratchHistograms
 
-  ScratchMemory(X_binned, y; config...) = begin
+  ScratchMemory(X_binned, y; mpi_comm, config...) = begin
     histogram_count = min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
     histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
 
     new(
       Vector{Loss}(undef, data_count(X_binned)*4),
-      Vector{Loss}(undef, data_count(X_binned)*2),
+      Vector{Loss}(undef, data_count(X_binned)*(isnothing(mpi_comm) ? 2 : 4)), # when not distributed, leaf_is will always be less than half the total
       # Vector{Loss}(undef, length(y)),
       # get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(y)) : nothing,
       Vector{index_type(y)}(undef, data_count(X_binned)),
@@ -824,7 +824,7 @@ function train_on_binned(X_binned, y; prior_trees=Tree[], mpi_comm = nothing, co
 
   trees = copy(prior_trees)
 
-  scratch_memory = ScratchMemory(X_binned, y; config...)
+  scratch_memory = ScratchMemory(X_binned, y; mpi_comm = mpi_comm, config...)
 
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
@@ -868,7 +868,7 @@ end
 # Returns new tree
 function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, mpi_comm = nothing, config...) :: Tree
   if isnothing(scratch_memory)
-    scratch_memory = ScratchMemory(X_binned, y, config...)
+    scratch_memory = ScratchMemory(X_binned, y; mpi_comm = mpi_comm, config...)
   end
   learning_rate       = Score(get_config_field(config, :learning_rate))
   bagging_temperature = DataWeight(get_config_field(config, :bagging_temperature))
@@ -1227,12 +1227,8 @@ function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇l
           ∇losses_∇∇losses_weights_consolidated =
             if isa(leaf.is, UnitRange)
               ∇losses_∇∇losses_weights
-            elseif length(leaf.is) <= div(data_count(X_binned),2)
-              consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf.is, ∇losses_∇∇losses_weights_scratch)
-            elseif !isnothing(mpi_comm) # when data is split across multiple computers, it is possible for a "small" leaf to have more than half the data
-              ∇losses_∇∇losses_weights
             else
-              throw(:leaf_is_length_should_never_be_more_than_half_the_real_total)
+              consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf.is, ∇losses_∇∇losses_weights_scratch)
             end
 
           compute_histograms!(X_binned, ∇losses_∇∇losses_weights_consolidated, feature_is_to_compute, leaf.features_histograms, leaf.is)
@@ -1322,6 +1318,10 @@ end
 # Get all our cache misses out of the way in one go.
 # Stores result in out (and returns out)
 function consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf_is, out)
+
+  # Make sure we weren't too fancy with allocating a minimal amount of scratch memory
+  @assert length(leaf_is) <= length(out)
+
   parallel_iterate(length(leaf_is)) do thread_range
     stride = 4
     leaf_ii_stop = thread_range.stop - stride + 1
