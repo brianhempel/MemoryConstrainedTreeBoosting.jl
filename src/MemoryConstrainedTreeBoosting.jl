@@ -169,12 +169,12 @@ function get_config_field(config, key)
 end
 
 # const ε = 1e-15 # Smallest Float64 power of 10 you can add to 1.0 and not round off to 1.0
-const ε = 1f-7 # Smallest Float64 power of 10 you can add to 1.0 and not round off to 1.0
+const ε = 1f-7 # Smallest Float32 power of 10 you can add to 1.0 and not round off to 1.0
 
-const Score      = Float64
-const Loss       = Float64
-const Prediction = Float64
-const DataWeight = Float64
+const Score      = Float32
+const Loss       = Float32
+const Prediction = Float32
+const DataWeight = Float32
 
 const BinSplits = Vector{T} where T <: AbstractFloat
 
@@ -209,7 +209,7 @@ const dont_split = SplitCandidate(0f0, 0, 0x00, 0f0, 0f0, 0f0, 0f0)
 
 #   LossInfo(∇loss, ∇∇loss, weight = 1f0) = new(∇loss, ∇∇loss, weight, 0f0)
 # end
-# zeros(LossInfo, n) = reinterpret(LossInfo, zeros(Float64, n*4))
+# zeros(LossInfo, n) = reinterpret(LossInfo, zeros(Float32, n*4))
 
 # mutable struct Histogram
 #   Σ∇losses     :: Vector{Loss}
@@ -602,7 +602,7 @@ function prepare_bin_splits(X :: Array{FeatureType,2}; bin_count = 255) :: Vecto
       split_sample_i = max(1, Int64(floor(sample_count / bin_count * split_i)))
       value_below_split = sorted_feature_values[split_sample_i]
       value_above_split = sorted_feature_values[min(split_sample_i + 1, sample_count)]
-      splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coercing Float64 to Float64
+      splits[split_i] = (value_below_split + value_above_split) / 2f0 # Avoid coercing Float32 to Float64
     end
 
     bin_splits[j] = splits
@@ -1048,7 +1048,7 @@ function compute_mean_probability(y, weights; mpi_comm = nothing)
       Σlabel  += Float64(y[i] * weights[i])
       Σweight += Float64(weights[i])
     end
-    (Float64(Σlabel), Float64(Σweight))
+    (Float32(Σlabel), Float32(Σweight))
   end
   mpi_mean(mpi_comm, sum(thread_Σlabels), sum(thread_Σweight))
 end
@@ -1065,9 +1065,9 @@ function _compute_mean_logloss(y, scores, weights :: Nothing)
       ŷ_i      = σ(scores[i])
       Σloss   += Float64(logloss(y[i], ŷ_i))
     end
-    Float64(Σloss)
+    Float32(Σloss)
   end
-  sum(thread_Σlosses), Float64(length(y))
+  sum(thread_Σlosses), Float32(length(y))
 end
 
 function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
@@ -1082,7 +1082,7 @@ function _compute_mean_logloss(y, scores, weights :: Vector{DataWeight})
       Σloss   += Float64(logloss(y[i], ŷ_i) * weights[i])
       Σweight += Float64(weights[i])
     end
-    (Float64(Σloss), Float64(Σweight))
+    (Float32(Σloss), Float32(Σweight))
   end
   sum(thread_Σlosses), sum(thread_Σweights)
 end
@@ -1156,7 +1156,7 @@ function sum_∇loss_∇∇loss(∇losses, ∇∇losses)
       Σ∇loss  += Float64(∇losses[i])
       Σ∇∇loss += Float64(∇∇losses[i])
     end
-    (Float64(Σ∇loss), Float64(Σ∇∇loss))
+    (Float32(Σ∇loss), Float32(Σ∇∇loss))
   end
 
   (sum(thread_Σ∇losses), sum(thread_Σ∇∇losses))
@@ -1334,7 +1334,7 @@ function consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weig
     @inbounds for leaf_ii in first_ii_unprocessed:thread_range.stop
       llw_i = llw_base_i(leaf_is[leaf_ii])
       SIMD.vstorea(
-        SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, llw_i),
+        SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i),
         out,
         llw_i_out
       )
@@ -1351,10 +1351,10 @@ function consolidate_∇losses_∇∇losses_weights_unrolled!(∇losses_∇∇lo
     llw_i2 = llw_base_i(leaf_is[leaf_ii+1])
     llw_i3 = llw_base_i(leaf_is[leaf_ii+2])
     llw_i4 = llw_base_i(leaf_is[leaf_ii+3])
-    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, llw_i1)
-    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, llw_i2)
-    loss_info3 = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, llw_i3)
-    loss_info4 = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, llw_i4)
+    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i1)
+    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i2)
+    loss_info3 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i3)
+    loss_info4 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_i4)
     SIMD.vstorea(loss_info1, out, llw_i_out)
     SIMD.vstorea(loss_info2, out, llw_i_out+4)
     SIMD.vstorea(loss_info3, out, llw_i_out+8)
@@ -1407,13 +1407,13 @@ function _build_histogram_unrolled!(X_binned, feature_start_i, ∇losses_∇∇l
     # # bin_i4 = feature_binned[i4]
 
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
-    bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram, bin_i1)
+    bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i1)
     loss_info_i = llw_base_i(ii)
-    loss_info = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, loss_info_i)
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
     SIMD.vstorea(bin + loss_info, histogram, bin_i1)
 
-    bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram, bin_i2)
-    loss_info = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, loss_info_i+4)
+    bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram, bin_i2)
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
     SIMD.vstorea(bin + loss_info, histogram, bin_i2)
 
     # histogram[bin_i1]     += ∇losses_∇∇losses_weights[llw_i1]
@@ -1481,17 +1481,17 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     # feat3_bin_i = llw_base_i(X_binned[feature_start_i3 + i])
 
     loss_info_i = llw_base_i(ii)
-    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, loss_info_i)
-    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, loss_info_i+4)
+    loss_info1 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i)
+    loss_info2 = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, loss_info_i+4)
 
     feat1_bin_i1 = llw_base_i(X_binned[feature_start_i1 + i1])
     feat2_bin_i1 = llw_base_i(X_binned[feature_start_i2 + i1])
 
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
-    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i1)
-    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i1)
+    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1)
+    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1)
 
-    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i)
     SIMD.vstorea(feat1_bin + loss_info1, histogram1, feat1_bin_i1)
     SIMD.vstorea(feat2_bin + loss_info1, histogram2, feat2_bin_i1)
     # SIMD.vstorea(feat3_bin + loss_info, histogram3, feat3_bin_i)
@@ -1499,8 +1499,8 @@ function _build_2histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
     feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
 
-    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i2)
-    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i2)
+    feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i2)
+    feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i2)
     SIMD.vstorea(feat1_bin + loss_info2, histogram1, feat1_bin_i2)
     SIMD.vstorea(feat2_bin + loss_info2, histogram2, feat2_bin_i2)
   end
@@ -1585,26 +1585,26 @@ function _build_3histograms_unrolled!(X_binned, feature_start_i1, feature_start_
     feat3_bin_i1 = llw_base_i(X_binned[feature_start_i3 + i1])
     # feat4_bin_i1 = llw_base_i(X_binned[feature_start_i4 + i1])
 
-    loss_info = SIMD.vloada(SIMD.Vec{4,Float64}, ∇losses_∇∇losses_weights, llw_base_i(ii))
+    loss_info = SIMD.vloada(SIMD.Vec{4,Float32}, ∇losses_∇∇losses_weights, llw_base_i(ii))
     # There's still a minor discrepency between the ∇losses_∇∇losses_weights and the ∇losses,∇∇losses,weights versions but it's not here.
-    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i1)
-    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i1)
-    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i1)
-    # feat4_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram4, feat4_bin_i1)
+    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1)
+    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i1)
+    # feat4_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram4, feat4_bin_i1)
 
-    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i)
-    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i1) + loss_info, histogram1, feat1_bin_i1)
-    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i1) + loss_info, histogram2, feat2_bin_i1)
-    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram3, feat3_bin_i1) + loss_info, histogram3, feat3_bin_i1)
-    # SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float64}, histogram4, feat4_bin_i1) + loss_info, histogram4, feat4_bin_i1)
+    # feat3_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i1) + loss_info, histogram1, feat1_bin_i1)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i1) + loss_info, histogram2, feat2_bin_i1)
+    SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram3, feat3_bin_i1) + loss_info, histogram3, feat3_bin_i1)
+    # SIMD.vstorea(SIMD.vloada(SIMD.Vec{4,Float32}, histogram4, feat4_bin_i1) + loss_info, histogram4, feat4_bin_i1)
     # SIMD.vstorea(feat4_bin + loss_info, features_histograms[4], feat4_bin_i1)
     # SIMD.vstorea(feat3_bin + loss_info, histogram3, feat3_bin_i)
 
     # feat1_bin_i2 = llw_base_i(X_binned[feature_start_i1 + i2])
     # feat2_bin_i2 = llw_base_i(X_binned[feature_start_i2 + i2])
 
-    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram1, feat1_bin_i2)
-    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float64}, histogram2, feat2_bin_i2)
+    # feat1_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram1, feat1_bin_i2)
+    # feat2_bin = SIMD.vloada(SIMD.Vec{4,Float32}, histogram2, feat2_bin_i2)
     # SIMD.vstorea(feat1_bin + loss_info2, histogram1, feat1_bin_i2)
     # SIMD.vstorea(feat2_bin + loss_info2, histogram2, feat2_bin_i2)
   end
@@ -1859,7 +1859,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
 
   # max_memory_accessed = min(data_count(X_binned)*length(feature_is_to_compute), 64*bytes_dispactched)
 
-  # println("$(bytes_dispactched/duration/1024/1024/1024)-$(max_memory_accessed/duration/1024/1024/1024) GB/s, likely $(est_memory_access/duration/1024/1024/1024) GB/s\t$(Float64(duration))s")
+  # println("$(bytes_dispactched/duration/1024/1024/1024)-$(max_memory_accessed/duration/1024/1024/1024) GB/s, likely $(est_memory_access/duration/1024/1024/1024) GB/s\t$(Float32(duration))s")
 
 end
 
@@ -1898,12 +1898,12 @@ end
 
 # returns Σ∇losses, Σ∇∇losses, Σweights
 function sum_histogram(histogram)
-  Σ∇losses_Σ∇∇losses_Σweights_Σdummy = SIMD.Vec{4,Float64}(0)
+  Σ∇losses_Σ∇∇losses_Σweights_Σdummy = SIMD.Vec{4,Float32}(0)
   @inbounds for i in 1:4:length(histogram)
-    Σ∇losses_Σ∇∇losses_Σweights_Σdummy += SIMD.vloada(SIMD.Vec{4,Float64}, histogram, i)
+    Σ∇losses_Σ∇∇losses_Σweights_Σdummy += SIMD.vloada(SIMD.Vec{4,Float32}, histogram, i)
   end
 
-  Σ∇losses, Σ∇∇losses, Σweights, Σdummy = NTuple{4,Float64}(Σ∇losses_Σ∇∇losses_Σweights_Σdummy)
+  Σ∇losses, Σ∇∇losses, Σweights, Σdummy = NTuple{4,Float32}(Σ∇losses_Σ∇∇losses_Σweights_Σdummy)
 
   (Σ∇losses, Σ∇∇losses, Σweights)
 end
