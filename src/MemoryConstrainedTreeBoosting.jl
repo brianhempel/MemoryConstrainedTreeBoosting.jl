@@ -468,27 +468,6 @@ function replace_leaf!(tree, old, replacement)
   end
 end
 
-function ancestors(target, tree)
-  if tree === target
-    Tree[]
-  elseif isa(tree, Node)
-    l = ancestors(target, tree.left)
-    if isnothing(l)
-      r = ancestors(target, tree.right)
-      if isnothing(r)
-        nothing
-      else
-        vcat(tree, r)
-      end
-    else
-      vcat(tree, l)
-    end
-  else
-    nothing
-  end
-end
-
-
 # Non-mutating. Returns a new tree with training info removed from the leaves.
 function strip_tree_training_info(tree) :: Tree
   if isa(tree, Node)
@@ -768,7 +747,7 @@ mutable struct ScratchHistograms
   ScratchHistograms(X_binned; config...) = begin
     raw_features_count = feature_count(X_binned) - length(unique(get_config_field(config, :exclude_features)))
     features_to_use_count = Int(ceil(get_config_field(config, :feature_fraction) * raw_features_count))
-    histogram_count = features_to_use_count * min(get_config_field(config, :max_leaves) * 2, 2^get_config_field(config, :max_depth))
+    histogram_count = features_to_use_count * min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
     histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
     histograms = map(_ -> resize!(Vector{Loss}(undef, histogram_size), 4*max_bins), 1:histogram_count)
 
@@ -808,12 +787,12 @@ mutable struct ScratchMemory
   scratch_histograms :: ScratchHistograms
 
   ScratchMemory(X_binned, y; mpi_comm, config...) = begin
-    histogram_count = min(get_config_field(config, :max_leaves) * 2, 2^get_config_field(config, :max_depth))
+    histogram_count = min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
     histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
 
     new(
       Vector{Loss}(undef, data_count(X_binned)*4),
-      Vector{Loss}(undef, data_count(X_binned)*(isnothing(mpi_comm) ? 4 : 4)), # when not distributed, leaf_is will always be less than half the total
+      Vector{Loss}(undef, data_count(X_binned)*(isnothing(mpi_comm) ? 2 : 4)), # when not distributed, leaf_is will always be less than half the total
       # Vector{Loss}(undef, length(y)),
       # get_config_field(config, :bagging_temperature) > 0 ? Vector{DataWeight}(undef, length(y)) : nothing,
       Vector{index_type(y)}(undef, data_count(X_binned)),
@@ -1195,9 +1174,6 @@ end
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
 function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
 
-  print_tree(tree)
-  println()
-
   # This still allocates :/
   leaves = sort(tree_leaves(tree), by = (leaf -> leaf.max_data_count_on_single_machine)) # Process smallest leaves first, should speed up histogram computation.
 
@@ -1261,9 +1237,7 @@ function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇l
           mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf.features_histograms, scratch_histograms)
         end
 
-        parents = ancestors(leaf, tree)
-
-        leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, parents, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+        leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
       end
     end # if leaf.maybe_split_candidate == nothing
   end # for leaf in leaves
@@ -1288,32 +1262,7 @@ function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇l
     # If root node, switch from unit range to our scratch memory
     scratch_is = isa(leaf_to_split.is, UnitRange) ? is : leaf_to_split.is
 
-    is_count = length(leaf_to_split.is)
-
     left_is, right_is = parallel_partition!(i -> feature_binned[i] <= split_i, scratch_is, trues, falses, leaf_to_split.is)
-
-    if isnothing(mpi_comm)
-      @assert length(left_is)  > 0
-      @assert length(right_is) > 0
-    else
-      left_len, right_len = mpi_sum(mpi_comm, length(left_is), length(right_is))
-      @assert left_len  > 0
-      @assert right_len > 0
-    end
-
-    @assert length(left_is) + length(right_is) == is_count
-
-    left_set  = Set(left_is)
-    right_set = Set(right_is)
-
-    @assert length(left_set)  == length(left_is)
-    @assert length(right_set) == length(right_is)
-
-    @assert isdisjoint(left_set, right_set)
-
-    @assert all(i -> feature_binned[i] <= split_i, left_is)
-    @assert all(i -> feature_binned[i] > split_i, right_is)
-
 
     left_leaf  = Leaf(split_candidate.left_Δscore,  left_is,  mpi_max(mpi_comm, length(left_is)),  split_candidate.left_data_weight,  nothing, [])
     right_leaf = Leaf(split_candidate.right_Δscore, right_is, mpi_max(mpi_comm, length(right_is)), split_candidate.right_data_weight, nothing, [])
@@ -1915,7 +1864,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
 end
 
 # Returns SplitCandidate(best_expected_Δloss, best_feature_i, best_split_i)
-function find_best_split(features_histograms, feature_is, parents, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+function find_best_split(features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
 
   thread_best_split_candidates =
     parallel_iterate(length(feature_is)) do thread_range
@@ -1932,9 +1881,7 @@ function find_best_split(features_histograms, feature_is, parents, min_data_weig
         end
 
         scratch_split_candidate.feature_i = feature_i
-        higher_splits_on_feature = map(higher_node -> higher_node.split_i, filter(higher_node -> feature_i == higher_node.feature_i, parents))
-
-        best_split_for_feature!(scratch_split_candidate, histogram, higher_splits_on_feature, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+        best_split_for_feature!(scratch_split_candidate, histogram, min_data_weight_in_leaf, l2_regularization, max_delta_score)
 
         if scratch_split_candidate.expected_Δloss < best_split_candidate.expected_Δloss
           best_split_candidate, scratch_split_candidate = scratch_split_candidate, best_split_candidate
@@ -1962,7 +1909,7 @@ function sum_histogram(histogram)
 end
 
 # Resets and mutates scratch_split_candidate
-function best_split_for_feature!(scratch_split_candidate, histogram, higher_splits_on_feature, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+function best_split_for_feature!(scratch_split_candidate, histogram, min_data_weight_in_leaf, l2_regularization, max_delta_score)
   best_expected_Δloss = Loss(0.0)
 
   scratch_split_candidate.expected_Δloss    = Loss(0.0)
@@ -1993,31 +1940,6 @@ function best_split_for_feature!(scratch_split_candidate, histogram, higher_spli
     left_Σ∇loss      += histogram[llw_i]
     left_Σ∇∇loss     += histogram[llw_i+1]
     left_data_weight += histogram[llw_i+2]
-
-    if bin_i in higher_splits_on_feature
-      right_Σ∇loss      = this_leaf_Σ∇loss  - left_Σ∇loss
-      right_Σ∇∇loss     = this_leaf_Σ∇∇loss - left_Σ∇∇loss
-      right_data_weight = this_leaf_data_weight - left_data_weight
-
-      try
-        @assert (right_Σ∇loss     == 0f0 || left_Σ∇loss       == 0f0)
-        @assert (right_Σ∇∇loss    == 0f0 || left_Σ∇∇loss      == 0f0)
-        @assert (left_data_weight == 0f0 || right_data_weight == 0f0)
-      catch e
-        if isa(e, AssertionError)
-          println("feature $(scratch_split_candidate.feature_i)")
-          println("split $(bin_i)")
-          println("left_Σ∇loss, right_Σ∇loss $((left_Σ∇loss, right_Σ∇loss))")
-          println("left_Σ∇∇loss, right_Σ∇∇loss $((left_Σ∇∇loss, right_Σ∇∇loss))")
-          println("left_data_weight, right_data_weight $((left_data_weight, right_data_weight))")
-          println("∇losses   $(llw_∇losses(histogram))")
-          println("∇∇losses  $(llw_∇∇losses(histogram))")
-          println("weights $(llw_weights(histogram))")
-        else
-          rethrow()
-        end
-      end
-    end
 
     if left_data_weight < min_data_weight_in_leaf
       continue
