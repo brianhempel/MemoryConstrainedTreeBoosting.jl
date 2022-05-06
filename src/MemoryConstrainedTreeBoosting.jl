@@ -346,11 +346,12 @@ function load_unbinned_predictor(path)
   predict
 end
 
-function print_tree(tree, level = 0; feature_i_to_name = nothing)
+function print_tree(tree, level = 0; feature_i_to_name = nothing, bin_splits = nothing)
   indentation = repeat("    ", level)
   if isa(tree, Node)
     feature_name = isnothing(feature_i_to_name) ? "feature $(tree.feature_i)" : feature_i_to_name(tree.feature_i)
-    println(indentation * "$feature_name\tsplit at $(tree.split_i)")
+    split_str = isnothing(bin_splits) ? "$(tree.split_i)" : "$(bin_splits[tree.feature_i][tree.split_i])"
+    println(indentation * "$feature_name\tsplit at $split_str")
     print_tree(tree.left,  level + 1, feature_i_to_name = feature_i_to_name)
     print_tree(tree.right, level + 1, feature_i_to_name = feature_i_to_name)
   else
