@@ -187,6 +187,9 @@ data_count(X :: Array{<:Number,2}) = size(X,1)
 feature_count(X :: Array{<:Number,2}) = size(X,2)
 
 
+const features_max_chunk_size = 12 # Features per thread work chunk
+
+
 abstract type Tree end
 
 mutable struct SplitCandidate # When running on multiple machines, these should always be the global stats.
@@ -785,10 +788,18 @@ mutable struct ScratchMemory
   trues    :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
   falses   :: Union{Vector{UInt32},Vector{Int64}} # During parallel partition
   scratch_histograms :: ScratchHistograms
+  scratch_accss :: Vector{Vector{Vector{Float64}}} # Float64 accumulators (12 per thread) to gain sum numeric stability
+
 
   ScratchMemory(X_binned, y; mpi_comm, config...) = begin
-    histogram_count = min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
-    histogram_size  = 4*max_bins + Int(64/sizeof(Loss)) # Ensure no two features share a cache line...allocate a little extra.
+    # histogram_count = min(get_config_field(config, :max_leaves), 2^get_config_field(config, :max_depth) - 1)
+
+    acc_size  = 4*max_bins + Int(64/sizeof(Float64)) # Ensure no two features share a cache line...allocate a little extra.
+
+    accss = Vector{Vector{Float64}}[]
+    for i in 1:Threads.nthreads()
+      push!(accss, map(_ -> Vector{Float64}(undef, acc_size), 1:features_max_chunk_size))
+    end
 
     new(
       Vector{Loss}(undef, data_count(X_binned)*4),
@@ -798,7 +809,8 @@ mutable struct ScratchMemory
       Vector{index_type(y)}(undef, data_count(X_binned)),
       Vector{index_type(y)}(undef, data_count(X_binned)),
       Vector{index_type(y)}(undef, data_count(X_binned)),
-      ScratchHistograms(X_binned; config...)
+      ScratchHistograms(X_binned; config...),
+      accss
     )
   end
 end
@@ -882,13 +894,15 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   trues    = scratch_memory.trues
   falses   = scratch_memory.falses
   scratch_histograms = scratch_memory.scratch_histograms
+  scratch_accss = scratch_memory.scratch_accss
   reset_scratch_histograms(scratch_histograms)
+
 
   compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights)
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weights)
 
-  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = mpi_comm, config...)
+  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms, scratch_accss; mpi_comm = mpi_comm, config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
@@ -926,7 +940,7 @@ function bagged_weights!(weights, bagging_temperature, out)
   ()
 end
 
-function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
+function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms, scratch_accss; mpi_comm = nothing, config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
   max_data_count_on_single_machine = mpi_max(mpi_comm, length(all_is))
@@ -959,7 +973,7 @@ function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇�
     # print_tree(tree)
     # println()
     # println()
-    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = mpi_comm, config...)
+    (tree_changed, tree) = perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms, scratch_accss; mpi_comm = mpi_comm, config...)
   end
 
   tree
@@ -1172,7 +1186,7 @@ end
 # Mutates tree, but also returns the tree in case tree was a lone leaf.
 #
 # Returns (bool, tree) where bool is true if any split was made, otherwise false.
-function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms; mpi_comm = nothing, config...)
+function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, feature_is, trues, falses, scratch_histograms, scratch_accss; mpi_comm = nothing, config...)
 
   # This still allocates :/
   leaves = sort(tree_leaves(tree), by = (leaf -> leaf.max_data_count_on_single_machine)) # Process smallest leaves first, should speed up histogram computation.
@@ -1231,7 +1245,7 @@ function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇l
               consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf.is, ∇losses_∇∇losses_weights_scratch)
             end
 
-          compute_histograms!(X_binned, ∇losses_∇∇losses_weights_consolidated, feature_is_to_compute, leaf.features_histograms, leaf.is)
+          compute_histograms!(X_binned, ∇losses_∇∇losses_weights_consolidated, feature_is_to_compute, leaf.features_histograms, scratch_accss, leaf.is)
 
           # We only calculated the histogram for our local data. Sum with the rest of the data, so histograms are global.
           mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf.features_histograms, scratch_histograms)
@@ -1754,13 +1768,33 @@ mutable struct Hists
   # hist4 :: Vector{Loss}
 end
 
-function make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms)
+function acc_hist!(acc, hist)
+  @inbounds for j in 1:length(acc)
+    acc[j] += Float64(hist[j])
+    hist[j] = 0f0
+  end
+end
+
+function acc_hist_final!(acc, hist)
+  @inbounds for j in 1:length(acc)
+    hist[j] = Float32(acc[j] + Float64(hist[j]))
+  end
+end
+
+function make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms, accs)
+
+  # Recover some numeric stability by dumping into Float64 acc periodically
+  for i in 1:length(accs)
+    accs[i] .= 0.0
+  end
+  rows_per_acc_chunk = 20000
+  rows_this_acc_chunk = 0
+
   for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
     # for feature_ii in 1:length(chunk_feature_is_to_compute) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
     # for feature_ii in 1:2:(length(chunk_feature_is_to_compute)-1) # Currently: 8704 points/feature = histograms reloaded 1100x = 61GB of histogram loading; 448 pts/feature = histograms reloaded 22000x = 1200GB of histogram loading BUT all that should be from L3; ideally each histogram is loaded into L3 only once
     feature_ii = chunk_feature_ii_start
     while feature_ii <= chunk_feature_ii_stop
-
       # Always 171GB of X_binned loading (unavoidable)
       if feature_ii + 2 <= chunk_feature_ii_stop
         feature_i1 = feature_is_to_compute[feature_ii]
@@ -1785,10 +1819,33 @@ function make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, le
       end
     end
 
+    rows_this_acc_chunk += min(ii+is_chunk_size-1, length(leaf_is)) - ii + 1
+    if rows_this_acc_chunk >= rows_per_acc_chunk
+      feature_ii = chunk_feature_ii_start
+      while feature_ii <= chunk_feature_ii_stop
+        iii = feature_ii - chunk_feature_ii_start + 1
+        acc = accs[iii]
+        hist = features_histograms[feature_is_to_compute[feature_ii]]
+        acc_hist!(acc, hist)
+        feature_ii += 1
+      end
+      rows_this_acc_chunk = 0
+    end
   end
+
+  feature_ii = chunk_feature_ii_start
+  while feature_ii <= chunk_feature_ii_stop
+    iii = feature_ii - chunk_feature_ii_start + 1
+    acc = accs[iii]
+    hist = features_histograms[feature_is_to_compute[feature_ii]]
+    acc_hist_final!(acc, hist)
+    feature_ii += 1
+  end
+
+  ()
 end
 
-function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, features_histograms, leaf_is)
+function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_is_to_compute, features_histograms, scratch_accss, leaf_is)
 
   # println((length(leaf_is), length(feature_is_to_compute)))
 
@@ -1811,10 +1868,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
     #   Int64(round(pts_per_∇losses_cache_line * cache_lines / 4)) # That 85k needs to be shared over 3 arrays: ∇losses_∇∇losses_weights
     # end
 
-  features_chunk_size = 12
-
-
-  features_chunk_size = clamp(Int64(floor(length(feature_is_to_compute) / Threads.nthreads())), 1, features_chunk_size)
+  features_chunk_size = clamp(Int64(floor(length(feature_is_to_compute) / Threads.nthreads())), 1, features_max_chunk_size)
 
   # For 256kb L2, ~12,000 ≈ 192kb resident ∇losses_∇∇losses_weights, leaf_is + 12kb X_binned + 3k Σ∇losses Σ∇∇losses data_weights per feature
   # L3 more difficult to compute b/c lots of X_binned and leaf_is flowing through it
@@ -1838,7 +1892,7 @@ function compute_histograms!(X_binned, ∇losses_∇∇losses_weights, feature_i
 
     chunk_feature_ii_stop = min(chunk_feature_ii_start + features_chunk_size - 1, length(feature_is_to_compute))
 
-    make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms)
+    make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms, scratch_accss[Threads.threadid()])
 
   end
 
