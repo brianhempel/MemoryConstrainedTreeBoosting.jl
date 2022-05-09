@@ -127,9 +127,9 @@ duration = @elapsed train_on_binned(
   mpi_comm = comm,
   iteration_count = 10_000,
   learning_rate = 0.01,
-  l2_regularization = 1.0,
+  l2_regularization = 10.0,
   feature_fraction = 0.4,
-  min_data_weight_in_leaf = 3.0,
+  min_data_weight_in_leaf = 2.9,
   max_delta_score = 5.0,
   max_leaves = 120,
   max_depth = 8,
@@ -140,6 +140,6 @@ duration = @elapsed train_on_binned(
 MPI.Barrier(comm)
 if rank == root
   println()
-  println("$duration seconds. Expected best validation loss: 0.2816312 (or thereabouts)")
+  println("$duration seconds. Expected best validation loss: 0.2809 (or thereabouts)")
   println()
 end

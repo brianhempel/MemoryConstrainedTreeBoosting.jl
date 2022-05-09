@@ -32,7 +32,7 @@ function make_iteration_callback()
     )
 end
 
-trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.8, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
 # trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 100, feature_fraction = 0.5, max_leaves = 6, bagging_temperature = 0.5)
 #
 # save_path = tempname()

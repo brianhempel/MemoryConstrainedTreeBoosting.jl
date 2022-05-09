@@ -142,7 +142,7 @@ default_config = (
   weights                            = nothing, # weights for the data
   bin_count                          = 255,
   iteration_count                    = 100,
-  min_data_weight_in_leaf            = 10.0,
+  min_data_weight_in_leaf            = 9.9, # Because of numeric instability, use a number slightly lower that what you mean (10.0)
   l2_regularization                  = 1.0,
   max_leaves                         = 32,
   max_depth                          = 6,
@@ -1180,6 +1180,7 @@ end
 function leaf_expected_Δloss(Σ∇loss :: Loss, Σ∇∇loss :: Loss, l2_regularization :: Loss, max_delta_score :: Score)
   Δscore = optimal_Δscore(Σ∇loss, Σ∇∇loss, l2_regularization, max_delta_score)
 
+  # One could add the l2_regularization to the Σ∇∇loss term here, but in my one brief test it seemed not to help much.
   Σ∇loss * Δscore + 0.5f0 * Σ∇∇loss * Δscore * Δscore
 end
 
