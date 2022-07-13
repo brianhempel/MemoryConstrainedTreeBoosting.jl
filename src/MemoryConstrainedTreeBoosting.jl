@@ -448,11 +448,11 @@ function leaf_depth(tree, leaf) :: Union{Int64,Nothing}
     nothing
   else
     left_depth = leaf_depth(tree.left, leaf)
-    if left_depth != nothing
+    if !isnothing(left_depth)
       left_depth + 1
     else
       right_depth = leaf_depth(tree.right, leaf)
-      right_depth == nothing ? nothing : right_depth + 1
+      isnothing(right_depth) ? nothing : right_depth + 1
     end
   end
 end
