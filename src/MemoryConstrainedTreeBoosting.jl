@@ -1255,7 +1255,7 @@ function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇l
           mpi_sum_histograms!(mpi_comm, feature_is_to_compute, leaf.features_histograms, scratch_histograms)
         end
 
-        leaf.maybe_split_candidate = find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
+        leaf.maybe_split_candidate = leaf_too_small_to_split ? dont_split : find_best_split(leaf.features_histograms, feature_is, min_data_weight_in_leaf, l2_regularization, max_delta_score)
       end
     end # if leaf.maybe_split_candidate == nothing
   end # for leaf in leaves
