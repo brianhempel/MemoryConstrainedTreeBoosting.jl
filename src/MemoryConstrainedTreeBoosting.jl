@@ -588,7 +588,8 @@ function prepare_bin_splits(X :: Array{FeatureType,2}; bin_count = 255) :: Vecto
     error("prepare_bin_splits: bin_count must be between 2 and 255")
   end
   ideal_sample_count = bin_count * 1_000
-  is = sort(collect(Iterators.take(Random.shuffle(1:data_count(X)), ideal_sample_count)))
+  rng = Random.MersenneTwister(123456)
+  is = sort(collect(Iterators.take(Random.shuffle(rng, 1:data_count(X)), ideal_sample_count)))
 
   sample_count = length(is)
   split_count = bin_count - 1
@@ -841,7 +842,7 @@ function train_on_binned(X_binned, y; prior_trees=Tree[], mpi_comm = nothing, co
   try
     for iteration_i in 1:get_config_field(config, :iteration_count)
       duration = @elapsed begin
-        tree = train_one_iteration(X_binned, y, weights, scores; scratch_memory = scratch_memory, mpi_comm = mpi_comm, config...)
+        tree = train_one_iteration(X_binned, y, weights, scores, length(trees); scratch_memory = scratch_memory, mpi_comm = mpi_comm, config...)
         tree = strip_tree_training_info(tree) # For long boosting sessions, should save memory if we strip off the list of indices
         apply_tree!(X_binned, tree, scores)
 
@@ -878,7 +879,7 @@ end
 
 
 # Returns new tree
-function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}; scratch_memory = nothing, mpi_comm = nothing, config...) :: Tree
+function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vector{DataWeight}, scores :: Vector{Score}, n_prior_trees :: Int64; scratch_memory = nothing, mpi_comm = nothing, config...) :: Tree
   if isnothing(scratch_memory)
     scratch_memory = ScratchMemory(X_binned, y; mpi_comm = mpi_comm, config...)
   end
@@ -898,18 +899,19 @@ function train_one_iteration(X_binned, y :: Vector{Prediction}, weights :: Vecto
   reset_scratch_histograms(scratch_histograms)
 
 
-  compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights)
+  compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights, n_prior_trees, mpi_comm)
   # Needs to be a separate method otherwise type inference croaks.
   compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weights)
 
-  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms, scratch_accss; mpi_comm = mpi_comm, config...)
+  tree = build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms, scratch_accss, n_prior_trees; mpi_comm = mpi_comm, config...)
   tree = scale_leaf_Δscores(tree, learning_rate)
   tree
 end
 
 # Mutates out
-function bagged_weights!(weights, bagging_temperature, out)
-  seed = rand(Int)
+function bagged_weights!(weights, bagging_temperature, out, n_prior_trees, mpi_comm)
+  rank = isnothing(mpi_comm) ? 0 : MPI.Comm_rank(mpi_comm)
+  seed = 19 + n_prior_trees * 971 + rank * 17
 
   # logs and powers are slow; sample from pre-computed distribution for non-extreme values.
 
@@ -921,7 +923,7 @@ function bagged_weights!(weights, bagging_temperature, out)
   weight_lookup .*= temperature_compensation
 
   parallel_iterate(length(weights)) do thread_range
-    rng = Random.MersenneTwister(abs(seed + thread_range.start * 1234))
+    rng = Random.MersenneTwister(seed + thread_range.start * 641)
     @inbounds for i in thread_range
       bin_i = rand(rng, 1:100)
       count =
@@ -940,7 +942,7 @@ function bagged_weights!(weights, bagging_temperature, out)
   ()
 end
 
-function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms, scratch_accss; mpi_comm = nothing, config...)
+function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇∇losses_weights_scratch, is, trues, falses, scratch_histograms, scratch_accss, n_prior_trees; mpi_comm = nothing, config...)
   # Use a range rather than a list for the root. Saves us having to initialize is.
   all_is = UnitRange{index_type(1:data_count(X_binned))}(1:data_count(X_binned))
   max_data_count_on_single_machine = mpi_max(mpi_comm, length(all_is))
@@ -960,8 +962,9 @@ function build_one_tree(X_binned, ∇losses_∇∇losses_weights, ∇losses_∇�
   # This still allocates :/
   # I suspect the cache benefits for sorting the indexes are trivial but it feels cleaner.
   feature_is = mpi_compute_on_one_and_share(mpi_comm) do
+    rng = Random.MersenneTwister(7 + n_prior_trees * 113)
     sort(
-      Random.shuffle(
+      Random.shuffle(rng,
         setdiff(UInt32(1):UInt32(feature_count(X_binned)), get_config_field(config, :exclude_features))
       )[1:features_to_use_count]
     )
@@ -1107,11 +1110,11 @@ llw_∇losses(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_we
 llw_∇∇losses(∇losses_∇∇losses_weights) = @view ∇losses_∇∇losses_weights[2:4:length(∇losses_∇∇losses_weights)]
 llw_weights(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_weights[3:4:length(∇losses_∇∇losses_weights)]
 
-function compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights)
+function compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights, n_prior_trees, mpi_comm)
   out = llw_weights(∇losses_∇∇losses_weights)
   # Adapted from Catboost
   if bagging_temperature > 0
-    bagged_weights!(weights, bagging_temperature, out)
+    bagged_weights!(weights, bagging_temperature, out, n_prior_trees, mpi_comm)
   else
     parallel_iterate(length(weights)) do thread_range
       out[thread_range] = weights[thread_range]

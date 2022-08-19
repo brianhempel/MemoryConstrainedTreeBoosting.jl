@@ -29,6 +29,11 @@ end
 
 
 # See https://catboost.ai/#benchmark for comparison.
+#
+#          CatBoost           LightGBM           XGBoost           H20
+#          Tuned    Default   Tuned    Default   Tuned   Default   Tuned   Default
+# Adult    0.26974  0.27298   0.27602  0.28716   0.27542 0.28009   0.27510 0.27607
+#                   +1.21%    +2.33%   +6.46%    +2.11%  +3.84%    +1.99%  +2.35%
 
 function make_numeric(column)
   # If numeric, pass through. Map ? to 0
