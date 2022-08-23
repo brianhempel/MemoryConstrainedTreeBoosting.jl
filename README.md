@@ -28,18 +28,20 @@ bin_splits, trees =
   train(
     X, y;
     # Defaults below:
-    weights                 = nothing,
-    bin_count               = 255,
-    iteration_count         = 100,
-    min_data_weight_in_leaf = 9.9, # Because of numeric instability, use a number slightly lower that what you mean (10.0)
-    l2_regularization       = 1.0,
-    max_leaves              = 32,
-    max_depth               = 6,
-    max_delta_score         = 1.0e10, # Before shrinkage.
-    learning_rate           = 0.03,
-    feature_fraction        = 1.0, # Per tree.
-    exclude_features        = [], # Indices. Applied before feature_fraction
-    bagging_temperature     = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
+    weights                  = nothing,
+    bin_count                = 255,
+    iteration_count          = 100,
+    min_data_weight_in_leaf  = 9.9, # Because of numeric instability, use a number slightly lower that what you mean (10.0)
+    l2_regularization        = 1.0,
+    max_leaves               = 32,
+    max_depth                = 6,
+    max_delta_score          = 1.0e10, # Before shrinkage.
+    learning_rate            = 0.03,
+    feature_fraction         = 1.0, # Per tree.
+    second_opinion_weight    = 0.0, # 0.0 = no second opinion. 1.0 = look at expected gains for sibling when choosing feature splits, choose feature that maximizes gains for both siblings. Inspired by Catboost choosing same split and feature across an entire level, so-called "oblivious" decision trees. But we are not going so far as to choose the same split point.
+    normalize_second_opinion = false, # true = make the best expected gain on the sibling match the leaf's best expected gain before applying the second opinion weight (in case of highly imbalanced nodes, this makes the leaf with more data count less)
+    exclude_features         = [], # Indices. Applied before feature_fraction
+    bagging_temperature      = 1.0, # Same as Catboost's Bayesian bagging. 0.0 doesn't change the weights. 1.0 samples from the exponential distribution to scale each datapoint's weight.
     iteration_callback                 = nothing, # Optional. Callback is given trees. If you want to override the default early stopping validation callback which is auto-generated if validation data is provided.
   	validation_X                       = nothing,
  	  validation_y                       = nothing,
