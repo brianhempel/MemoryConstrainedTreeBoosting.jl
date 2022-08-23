@@ -62,8 +62,10 @@ trees = train_on_binned(X_binned, y, weights = weights, iteration_count = 2, fea
 # ProfileView.view()
 # read(stdin,UInt8)
 
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
-@time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+@time begin
+  @time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+  @time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+  @time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+  @time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+  @time train_on_binned(X_binned, y, weights = weights, iteration_count = 10, feature_fraction = 0.9, min_data_weight_in_leaf = 30000, max_leaves = 6, bagging_temperature = 0.5, iteration_callback = make_iteration_callback())
+end

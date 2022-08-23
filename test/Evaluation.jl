@@ -14,7 +14,7 @@ Random.seed!(123456)
 # Adult    0.26974  0.27298   0.27602  0.28716   0.27542 0.28009   0.27510 0.27607
 #                   +1.21%    +2.33%   +6.46%    +2.11%  +3.84%    +1.99%  +2.35%
 
-# Single thread: 0.2812351
+# Single thread: 0.28078794
 
 function make_numeric(column)
   # If numeric, pass through. Map ? to 0
@@ -120,6 +120,8 @@ train_on_binned(X_binned, y, iteration_count = 2, feature_fraction = 0.9, max_le
   learning_rate = 0.01,
   l2_regularization = 10.0,
   feature_fraction = 0.4,
+  second_opinion_weight = 0.75,
+  normalize_second_opinion = false,
   min_data_weight_in_leaf = 2.9,
   max_delta_score = 5.0,
   max_leaves = 120,
