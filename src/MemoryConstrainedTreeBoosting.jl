@@ -1970,8 +1970,9 @@ function find_best_split(features_expected_Δlosses, sibling_features_expected_�
     second_opinion_weight *= minimum(features_expected_Δlosses) / (minimum(sibling_features_expected_Δlosses) - ε)
   end
   @assert length(features_expected_Δlosses) == length(sibling_features_expected_Δlosses)
+  @assert length(features_expected_Δlosses) == length(feature_is)
   # findmin with a min_by function seems to allocate...do it the old fashioned way :(
-  feature_ii_to_split = feature_is[1]
+  feature_ii_to_split = 1
   best_Δloss = Loss(0)
   @inbounds for feature_ii in eachindex(features_expected_Δlosses)
     if features_expected_Δlosses[feature_ii] < Loss(0) # Don't get a second opinion on features that this leaf can't split on.
