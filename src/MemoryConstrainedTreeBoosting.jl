@@ -1013,6 +1013,31 @@ function mpi_print(comm, str)
   end
 end
 
+function copy_llwd_hist_to_llw_hist!(llwd_hist, llw_hist)
+  llwd_bin_i = 1
+  llw_bin_i  = 1
+  @inbounds for bin_i in 1:max_bins
+    llw_hist[llw_bin_i]     = llwd_hist[llwd_bin_i]
+    llw_hist[llw_bin_i + 1] = llwd_hist[llwd_bin_i + 1]
+    llw_hist[llw_bin_i + 2] = llwd_hist[llwd_bin_i + 2]
+    llwd_bin_i += 4
+    llw_bin_i  += 3
+  end
+end
+
+function copy_llw_hist_to_llwd_hist!(llw_hist, llwd_hist)
+  llwd_bin_i = 1
+  llw_bin_i  = 1
+  @inbounds for bin_i in 1:max_bins
+    llwd_hist[llwd_bin_i]     = llw_hist[llw_bin_i]
+    llwd_hist[llwd_bin_i + 1] = llw_hist[llw_bin_i + 1]
+    llwd_hist[llwd_bin_i + 2] = llw_hist[llw_bin_i + 2]
+    llwd_bin_i += 4
+    llw_bin_i  += 3
+  end
+end
+
+
 function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histograms, scratch_histograms)
   isnothing(comm) && return ()
   length(feature_is_to_compute) == 0 && return ()
@@ -1025,24 +1050,28 @@ function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histogra
   # Smash all the histograms into one long array before sending off.
   # Reduces communication calls.
 
-  hist_size = length(leaf_features_histograms[feature_is_to_compute[1]])
+  hist_size = 3*max_bins
 
   if isnothing(scratch_histograms.consolidated_for_mpi_communication)
-    scratch_histograms.consolidated_for_mpi_communication = Vector{Loss}(undef, hist_size * length(feature_is_to_compute))
+    buf = Vector{Loss}(undef, hist_size * length(feature_is_to_compute))
+    scratch_histograms.consolidated_for_mpi_communication = buf
+  else
+    buf = scratch_histograms.consolidated_for_mpi_communication :: Vector{Loss}
   end
-  buf = scratch_histograms.consolidated_for_mpi_communication
 
   # We thread all the other places like this, so...
   Threads.@threads for feature_ii in 1:length(feature_is_to_compute)
     feature_i = feature_is_to_compute[feature_ii]
-    buf[(feature_ii-1)*hist_size + 1 : feature_ii*hist_size] = leaf_features_histograms[feature_i]
+    histogram = leaf_features_histograms[feature_i]
+    copy_llwd_hist_to_llw_hist!(histogram, @view buf[1 + (feature_ii-1)*hist_size : feature_ii*hist_size])
   end
 
   MPI.Allreduce!(buf, +, comm)
 
   Threads.@threads for feature_ii in 1:length(feature_is_to_compute)
     feature_i = feature_is_to_compute[feature_ii]
-    leaf_features_histograms[feature_i][:] = @view buf[(feature_ii-1)*hist_size + 1 : feature_ii*hist_size]
+    histogram = leaf_features_histograms[feature_i]
+    copy_llw_hist_to_llwd_hist!((@view buf[1 + (feature_ii-1)*hist_size : feature_ii*hist_size]), histogram)
   end
 
   ()
@@ -1122,6 +1151,7 @@ llw_∇losses(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_we
 llw_∇∇losses(∇losses_∇∇losses_weights) = @view ∇losses_∇∇losses_weights[2:4:length(∇losses_∇∇losses_weights)]
 llw_weights(∇losses_∇∇losses_weights)  = @view ∇losses_∇∇losses_weights[3:4:length(∇losses_∇∇losses_weights)]
 
+# Stores results in weights of ∇losses_∇∇losses_weights
 function compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_weights, n_prior_trees, mpi_comm)
   out = llw_weights(∇losses_∇∇losses_weights)
   # Adapted from Catboost
@@ -1135,7 +1165,7 @@ function compute_weights!(weights, bagging_temperature, ∇losses_∇∇losses_w
   ()
 end
 
-# Stores results in ∇losses, ∇∇losses of ∇losses_∇∇losses_weights
+# Stores results in ∇losses, ∇∇losses of ∇losses_∇∇losses_weights, with the weights already applied
 function compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weights)
   llw = ∇losses_∇∇losses_weights
   parallel_iterate(length(y)) do thread_range
