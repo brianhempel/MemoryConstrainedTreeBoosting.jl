@@ -170,8 +170,7 @@ function get_config_field(config, key)
   end
 end
 
-# const ε = 1e-15 # Smallest Float64 power of 10 you can add to 1.0 and not round off to 1.0
-const ε = 1f-7 # Smallest Float32 power of 10 you can add to 1.0 and not round off to 1.0
+const ε = eps(Float32) # 1.1920929f-7
 
 const Score      = Float32
 const Loss       = Float32
@@ -997,8 +996,9 @@ end
 
 σ(x) = 1.0f0 / (1.0f0 + exp(-x))
 
-# Copied from Flux.jl.
-logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε)
+# Copied from Flux.jl, except for logloss_ε_correction
+const logloss_ε_correction = log(1f0 + ε) # make logloss(0,0) and logloss(1,1) be zero instead of slightly negative
+logloss(y, ŷ) = -y*log(ŷ + ε) - (1.0f0 - y)*log(1.0f0 - ŷ + ε) + logloss_ε_correction
 
 # Derivatives with respect to margin (i.e. pre-sigmoid values, but you still provide the post-sigmoid probability).
 #
@@ -1112,8 +1112,8 @@ function compute_mean_probability(y, weights; mpi_comm = nothing)
 end
 
 function compute_mean_logloss(y, scores; weights = nothing, mpi_comm = nothing)
-  Σlosses, Σweights =  _compute_mean_logloss(y, scores, weights)
-  mpi_mean(mpi_comm, Σlosses, Σweights)
+  Σloss, Σweight =  _compute_mean_logloss(y, scores, weights)
+  mpi_mean(mpi_comm, Σloss, Σweight)
 end
 
 function _compute_mean_logloss(y, scores, weights :: Nothing)
