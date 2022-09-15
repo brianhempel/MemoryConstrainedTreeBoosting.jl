@@ -164,6 +164,8 @@ for config in hyperparameter_configs
   )
 
   function my_iteration_callback(trees)
+    global global_best_loss
+
     validation_loss = original_callback(trees)
 
     if validation_loss < global_best_loss

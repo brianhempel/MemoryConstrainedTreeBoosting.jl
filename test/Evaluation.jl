@@ -15,6 +15,7 @@ Random.seed!(123456)
 #                   +1.21%    +2.33%   +6.46%    +2.11%  +3.84%    +1.99%  +2.35%
 
 # Single thread: 0.28078803
+# Multi  thread: 0.28078803
 
 function make_numeric(column)
   # If numeric, pass through. Map ? to 0
