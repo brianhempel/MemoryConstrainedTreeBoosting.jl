@@ -1,6 +1,10 @@
 # MemoryConstrainedTreeBoosting.jl
 
-Fast, gradient-boosted decision trees when you want to use all the memory on your machine. Only binary classification with logloss on `Float32` data is supported right now.
+Gradient-boosted decision trees when you want to use all the memory on your machine. Also supports distributed learning if your data doesn't fit on one machine. Also, it's quite fast.
+
+For input, only `Float32` data is supported right now, unless you perform your own initial binning down to `UInt8`. Note if you do so: because of Julia's indexing, bins are 1-255, not 0-255. (You can use fewer than 255 bins, but start at 1, not 0.)
+
+Only binary classification with logloss is supported right now. If you need to, you can probably fork the repo transform that to single variable regression pretty easily. (Multivariate loss is harder.)
 
 Powers [nadocast.com](http://nadocast.com).
 

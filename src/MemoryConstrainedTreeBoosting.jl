@@ -16,7 +16,7 @@ using MPI
 function parallel_iterate(f, count)
   thread_results = Vector{Any}(undef, Threads.nthreads())
 
-  Threads.@threads for thread_i in 1:Threads.nthreads()
+  Threads.@threads :static for thread_i in 1:Threads.nthreads()
   # for thread_i in 1:Threads.nthreads()
     start = div((thread_i-1) * count, Threads.nthreads()) + 1
     stop  = div( thread_i    * count, Threads.nthreads())
@@ -35,7 +35,7 @@ end
 function parallel_iterate_work_stealing(f, chunks)
   chunk_ii = Threads.Atomic{Int64}(1)
 
-  Threads.@threads for thread_i in 1:Threads.nthreads()
+  Threads.@threads :static for thread_i in 1:Threads.nthreads()
     while (my_chunk_ii = Threads.atomic_add!(chunk_ii, 1)) <= length(chunks)
       f(chunks[my_chunk_ii])
     end
@@ -47,7 +47,7 @@ end
 
 function parallel_map!(f, out, in)
   @assert length(out) == length(in)
-  Threads.@threads for i in 1:length(in)
+  Threads.@threads :static for i in 1:length(in)
     @inbounds out[i] = f(in[i])
   end
   out
@@ -126,7 +126,7 @@ function parallel_partition!(f, out :: AbstractArray{T}, trues :: AbstractArray{
 end
 
 function _parallel_partition!(trues, falses, trues_end_indicies, falses_end_indicies, thread_trues, thread_falses)
-  Threads.@threads for thread_i in 1:Threads.nthreads()
+  Threads.@threads :static for thread_i in 1:Threads.nthreads()
     trues_start_index  = 1 + (thread_i >= 2 ? trues_end_indicies[thread_i-1]  : 0)
     falses_start_index = 1 + (thread_i >= 2 ? falses_end_indicies[thread_i-1] : 0)
     trues_range  = trues_start_index:trues_end_indicies[thread_i]
@@ -536,7 +536,7 @@ end
 
 # Mutates scores.
 function _apply_tree!(X_binned, fast_nodes :: Vector{FastNode}, scores :: Vector{Score}) :: Vector{Score}
-  Threads.@threads for i in 1:data_count(X_binned)
+  Threads.@threads :static for i in 1:data_count(X_binned)
     node_i = 1
     @inbounds while true
       node = fast_nodes[node_i]
@@ -558,16 +558,11 @@ end
 # Returns vector of untransformed scores (linear, pre-sigmoid). Does not mutate starting_scores.
 function apply_trees(X_binned, trees :: Vector{<:Tree}; starting_scores = nothing) :: Vector{Score}
 
-  # thread_scores = map(_ -> zeros(Score, data_count(X_binned)), 1:Threads.nthreads())
   scores = zeros(Score, data_count(X_binned))
 
-  # Threads.@threads for tree in trees
   for tree in trees
-    # apply_tree!(X_binned, tree, thread_scores[Threads.threadid()])
     apply_tree!(X_binned, tree, scores)
   end
-
-  # scores = sum(thread_scores)
 
   if !isnothing(starting_scores)
     scores += starting_scores
@@ -610,7 +605,7 @@ function prepare_bin_splits(X :: Array{FeatureType,2}; bin_count = 255) :: Vecto
 
   bin_splits = Vector{BinSplits{FeatureType}}(undef, feature_count(X))
 
-  Threads.@threads for j in 1:feature_count(X)
+  Threads.@threads :static for j in 1:feature_count(X)
   # for j in 1:feature_count(X)
     sorted_feature_values = sort(@view X[is, j])
 
@@ -633,7 +628,7 @@ end
 function apply_bins(X, bin_splits) :: Data
   X_binned = zeros(UInt8, size(X))
 
-  Threads.@threads for j in 1:feature_count(X)
+  Threads.@threads :static for j in 1:feature_count(X)
   # for j in 1:feature_count(X)
     splits_for_feature = bin_splits[j]
     bin_count = length(splits_for_feature) + 1
@@ -1060,7 +1055,7 @@ function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histogra
   end
 
   # We thread all the other places like this, so...
-  Threads.@threads for feature_ii in 1:length(feature_is_to_compute)
+  Threads.@threads :static for feature_ii in 1:length(feature_is_to_compute)
     feature_i = feature_is_to_compute[feature_ii]
     histogram = leaf_features_histograms[feature_i]
     copy_llwd_hist_to_llw_hist!(histogram, @view buf[1 + (feature_ii-1)*hist_size : feature_ii*hist_size])
@@ -1068,7 +1063,7 @@ function mpi_sum_histograms!(comm, feature_is_to_compute, leaf_features_histogra
 
   MPI.Allreduce!(buf, +, comm)
 
-  Threads.@threads for feature_ii in 1:length(feature_is_to_compute)
+  Threads.@threads :static for feature_ii in 1:length(feature_is_to_compute)
     feature_i = feature_is_to_compute[feature_ii]
     histogram = leaf_features_histograms[feature_i]
     copy_llw_hist_to_llwd_hist!((@view buf[1 + (feature_ii-1)*hist_size : feature_ii*hist_size]), histogram)
@@ -1184,7 +1179,7 @@ function compute_∇losses_∇∇losses!(y, scores, ∇losses_∇∇losses_weigh
     # out[thread_range] = weights[thread_range]
   end
 
-  # Threads.@threads for i in 1:length(y)
+  # Threads.@threads :static for i in 1:length(y)
   #   @inbounds begin
   #     ŷ_i = σ(scores[i])
   #     ∇losses[i]  = (ŷ_i - y[i])        * weights[i] # ∇logloss  = ŷ - y
@@ -1262,14 +1257,14 @@ function perhaps_split_tree(tree, X_binned, ∇losses_∇∇losses_weights, ∇l
         leaf.features_histograms = Vector{Union{Nothing,Histogram}}(nothing, feature_count(X_binned))
 
         # Don't really need threads on this one but it doesn't hurt.
-        Threads.@threads for feature_i in feature_is
+        Threads.@threads :static for feature_i in feature_is
           perhaps_calculate_feature_histogram_from_parent_and_sibling!(feature_i, tree, leaf)
         end
 
         feature_is_to_compute = filter(feature_i -> isnothing(leaf.features_histograms[feature_i]), feature_is)
 
         if !isempty(feature_is_to_compute)
-          Threads.@threads for feature_i in feature_is_to_compute
+          Threads.@threads :static for feature_i in feature_is_to_compute
             leaf.features_histograms[feature_i] = next_free_histogram(scratch_histograms)
           end
 
