@@ -280,7 +280,7 @@ end
 function tree_to_dict(leaf :: Leaf) :: Dict{Symbol,Any}
   Dict(
     :type        => "Leaf",
-    :delta_score => leaf.Δscore
+    :delta_score => Float64(leaf.Δscore) # newer BSON doesn't accept Float32
   )
 end
 
@@ -322,7 +322,7 @@ function load(path)
 end
 
 # I tried to use Julia's JIT, but it was horreeeeendeously slow to compile the trees
-# to native code (sometimes on the order of minutes). Of course, it was blazing fast_nodes
+# to native code (sometimes on the order of minutes). Of course, it was blazing fast
 # once that was done, but...
 function load_unbinned_predictor(path)
   bin_splits, trees = load(path)

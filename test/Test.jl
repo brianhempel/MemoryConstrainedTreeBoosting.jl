@@ -66,15 +66,19 @@ save_path = tempname()
 
 save(save_path, bin_splits, trees)
 
-bin_splits, trees = load(save_path)
+bin_splits2, trees2 = load(save_path)
 
 # Make sure load gives the types back correctly.
-bin_splits :: Vector{MemoryConstrainedTreeBoosting.BinSplits{Float32}}
-trees      :: Vector{MemoryConstrainedTreeBoosting.Tree}
+bin_splits2 :: Vector{MemoryConstrainedTreeBoosting.BinSplits{Float32}}
+trees2      :: Vector{MemoryConstrainedTreeBoosting.Tree}
 
-X_binned = apply_bins(X, bin_splits)
+@assert bin_splits == bin_splits2
+@assert repr(trees) == repr(trees2)
+@assert MemoryConstrainedTreeBoosting.tree_to_dict.(trees) == MemoryConstrainedTreeBoosting.tree_to_dict.(trees2)
 
-println(predict_on_binned(X_binned, trees))
+X_binned = apply_bins(X, bin_splits2)
+
+println(predict_on_binned(X_binned, trees2))
 println(y)
 
 println("Unbinned predictor")
@@ -83,4 +87,4 @@ unbinned_predict = load_unbinned_predictor(save_path)
 println(unbinned_predict(X))
 println(y)
 
-@assert sum(abs.(predict_on_binned(X_binned, trees) - unbinned_predict(X))) < 0.00001
+@assert sum(abs.(predict_on_binned(X_binned, trees2) - unbinned_predict(X))) < 0.00001
