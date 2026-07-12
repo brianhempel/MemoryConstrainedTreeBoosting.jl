@@ -1839,13 +1839,12 @@ function acc_hist_final!(acc, hist)
   end
 end
 
-function make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms, accs)
+function make_a_chunk_of_histograms(X_binned, ∇losses_∇∇losses_weights, leaf_is, chunk_feature_ii_start, chunk_feature_ii_stop, is_chunk_size, hists, feature_is_to_compute, features_histograms, accs; rows_per_acc_chunk = 20000)
 
   # Recover some numeric stability by dumping into Float64 acc periodically
   for i in 1:length(accs)
     accs[i] .= 0.0
   end
-  rows_per_acc_chunk = 20000
   rows_this_acc_chunk = 0
 
   for ii in 1:is_chunk_size:length(leaf_is) # Currently: 32 features/chunk * 16 threads = reloaded 36x = 5.5GB of leaf_is,∇losses,∇∇losses,weights loading
