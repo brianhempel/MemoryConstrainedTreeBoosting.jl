@@ -369,8 +369,8 @@ function print_tree(tree, level = 0; feature_i_to_name = nothing, bin_splits = n
     feature_name = isnothing(feature_i_to_name) ? "feature $(tree.feature_i)" : feature_i_to_name(tree.feature_i)
     split_str = isnothing(bin_splits) ? "$(tree.split_i)" : "$(bin_splits[tree.feature_i][tree.split_i])"
     println(indentation * "$feature_name\tsplit at $split_str")
-    print_tree(tree.left,  level + 1, feature_i_to_name = feature_i_to_name)
-    print_tree(tree.right, level + 1, feature_i_to_name = feature_i_to_name)
+    print_tree(tree.left,  level + 1, feature_i_to_name = feature_i_to_name, bin_splits = bin_splits)
+    print_tree(tree.right, level + 1, feature_i_to_name = feature_i_to_name, bin_splits = bin_splits)
   else
     println(indentation * "Δscore $(tree.Δscore)")
   end
@@ -1392,7 +1392,8 @@ end
 function consolidate_∇losses_∇∇losses_weights!(∇losses_∇∇losses_weights, leaf_is, out)
 
   # Make sure we weren't too fancy with allocating a minimal amount of scratch memory
-  @assert length(leaf_is) <= length(out)
+  # (we write 4 floats per leaf index)
+  @assert 4*length(leaf_is) <= length(out)
 
   parallel_iterate(length(leaf_is)) do thread_range
     stride = 4
@@ -1827,14 +1828,15 @@ mutable struct Hists
 end
 
 function acc_hist!(acc, hist)
-  @inbounds for j in 1:length(acc)
+  # acc is allocated slightly larger than hist (cache line padding), so iterate by hist's length
+  @inbounds for j in 1:length(hist)
     acc[j] += Float64(hist[j])
     hist[j] = 0f0
   end
 end
 
 function acc_hist_final!(acc, hist)
-  @inbounds for j in 1:length(acc)
+  @inbounds for j in 1:length(hist)
     hist[j] = Float32(acc[j] + Float64(hist[j]))
   end
 end
